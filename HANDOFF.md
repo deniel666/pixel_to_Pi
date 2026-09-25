@@ -41,7 +41,10 @@ t "cd projects/dashboard"
 t "python server.py"
 ```
 
-Tasks 2 and 3 below then just confirm this over SSH.
+Report the lines the dashboard prints (take a screenshot with
+`adb exec-out screencap -p > termux.png` if that's easier). Then do Task 1.
+Skip Tasks 2 and 3 while this foreground dashboard is running: they'd start a
+second copy on the same port.
 
 ## Task 1: connect to the phone over USB
 
