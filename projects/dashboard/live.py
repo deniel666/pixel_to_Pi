@@ -15,16 +15,49 @@ from pathlib import Path
 API = os.environ.get("LIVE_API_URL", "https://api.openai.com/v1/live/sessions")
 MODEL = os.environ.get("LIVE_MODEL", "gpt-live-1")
 VOICE = os.environ.get("LIVE_VOICE", "marin")
-# Model that handles delegated reasoning/tools (Responses delegation). Set to
-# "none" to run voice-only, with no delegation block in the session.
-BACKEND = os.environ.get("LIVE_BACKEND_MODEL", "gpt-5.5")
+# Backend model for delegated reasoning and web search (Responses delegation).
+# Docs suggest gpt-5.6-terra, or gpt-5.6-luna for lower cost. "none" = voice only.
+BACKEND = os.environ.get("LIVE_BACKEND_MODEL", "gpt-5.6-terra")
 
-INSTRUCTIONS = os.environ.get("LIVE_INSTRUCTIONS", (
-    "You are Pixel, a friendly voice assistant running on the user's Pixel 7 Pro, "
-    "which is hooked up to a big monitor as a home tinker computer. Keep replies short "
-    "and conversational. Reply in the language the user speaks (often Russian). "
-    "Delegate anything that needs current information or web search."
-))
+# Structure follows OpenAI's "Prompting GPT-Live" template; keep the three policy headings.
+INSTRUCTIONS = os.environ.get("LIVE_INSTRUCTIONS", """\
+You are Pixel, a calm, friendly voice assistant running on the user's Pixel 7 Pro,
+which is hooked up to a big monitor as a home tinker computer.
+Speak warmly and naturally. Keep replies short and conversational.
+Speak the language the user speaks; they often speak Russian.
+
+Backchannel policy: Use moderate backchannels. Acknowledge naturally without competing with the main response.
+
+Interruption policy: Stop speaking when the user interrupts. Listen to what they say.
+
+Delegation policy:
+Backend tools:
+- Web search: look up current information such as news, weather, prices, and facts.
+
+Delegate to the backend when:
+- The request needs current information, a web search, or careful reasoning.
+- A correction changes the work already requested.
+
+Do not delegate to the backend when:
+- You can answer from the conversation or a still-current result.
+- You need a brief clarification to understand the request.
+
+Delegate before giving an answer that depends on backend work.
+Do not guess the result while waiting.
+""")
+
+BACKEND_INSTRUCTIONS = """\
+## Voice conversation context
+You are helping an assistant in a live voice conversation. Transcripts can contain
+mistakes, unfinished phrases, and later corrections. Use the latest context. If a
+needed detail is still unclear, ask for that detail instead of guessing.
+
+## Task instructions
+Answer the user's question, using web search for anything current.
+
+## Return the result
+Return the relevant facts briefly, in the user's language. No Markdown.
+"""
 
 
 def api_key():
@@ -36,18 +69,25 @@ def api_key():
     return key
 
 
-def session_config(delegate=True):
-    cfg = {
-        "model": MODEL,
-        "instructions": INSTRUCTIONS,
-        "audio": {"output": {"voice": VOICE}},
-    }
-    if delegate and BACKEND.lower() != "none":
-        cfg["delegation"] = {
-            "type": "responses",
-            "responses": {"model": BACKEND, "tools": [{"type": "web_search"}]},
-        }
-    return cfg
+def session_configs():
+    """Configs to try in order: full, then without delegation, then minimal.
+
+    Only model, instructions and delegation are confirmed by the docs; the voice
+    field is a best guess, so each fallback drops the less certain parts.
+    """
+    base = {"model": MODEL, "instructions": INSTRUCTIONS}
+    voice = {"audio": {"output": {"voice": VOICE}}}
+    configs = []
+    if BACKEND.lower() != "none":
+        delegation = {"delegation": {"type": "responses", "responses": {
+            "model": BACKEND,
+            "instructions": BACKEND_INSTRUCTIONS,
+            "tools": [{"type": "web_search"}],
+        }}}
+        configs += [("responses+voice", {**base, **voice, **delegation}),
+                    ("responses", {**base, **delegation})]
+    configs += [("voice-only", {**base, **voice}), ("minimal", base)]
+    return configs
 
 
 def _post(url, body, key):
@@ -67,18 +107,20 @@ class LiveError(Exception):
 
 
 def create_session(offer_sdp):
-    """Returns (session_id, answer_sdp). If delegation is rejected, retries voice-only."""
+    """Returns (session_id, answer_sdp), falling back through session_configs() on 4xx."""
     key = api_key()
     if not key:
         raise LiveError("No OpenAI API key: put it in ~/.openai_key on the phone (chmod 600).")
     last = None
-    for delegate in (True, False):
-        body = {"session": session_config(delegate), "transport": {"type": "webrtc", "sdp": offer_sdp}}
+    for name, cfg in session_configs():
+        body = {"session": cfg, "transport": {"type": "webrtc", "sdp": offer_sdp}}
         try:
             data = _post(API, body, key)
         except urllib.error.HTTPError as e:
             last = f"HTTP {e.code}: {e.read().decode(errors='replace')[:800]}"
-            print(f"GPT-Live session create failed (delegation={delegate}): {last}")
+            print(f"GPT-Live session create failed ({name}): {last}")
+            if e.code in (401, 429) or e.code >= 500:
+                break  # bad key, quota, or outage: a smaller config won't help
             continue
         except urllib.error.URLError as e:
             raise LiveError(f"Can't reach OpenAI: {e.reason}")
@@ -86,7 +128,7 @@ def create_session(offer_sdp):
         if not sdp:
             raise LiveError(f"Unexpected response, no SDP answer: {json.dumps(data)[:800]}")
         sid = (data.get("session") or {}).get("id", "")
-        print(f"GPT-Live session {sid} started (delegation={delegate})")
+        print(f"GPT-Live session {sid} started ({name})")
         return sid, sdp
     raise LiveError(last or "GPT-Live session create failed")
 

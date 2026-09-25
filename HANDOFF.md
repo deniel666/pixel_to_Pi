@@ -112,7 +112,10 @@ t "python server.py"
 adb shell am start -a android.intent.action.VIEW -d http://localhost:8000/voice.html
 ```
 
-The user taps **Start**, allows the microphone, and talks. Transcripts appear
+The user taps **👂 Wake word** once (allow the microphone), then says
+**«Привет, Пиксель»** (rising chime = starting, ding = ready) and talks.
+**«Пока, Пиксель»** or 45 s of silence ends the call (falling chime).
+A low buzz means an error. Transcripts appear
 on the Mac dashboard. **Report back**: the status and red error text on the
 phone page (if any), the "Event types seen" list (expand it at the bottom),
 and any `GPT-Live session ...` lines the dashboard printed in Termux.
