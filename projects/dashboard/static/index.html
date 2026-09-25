@@ -1,0 +1,162 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pixel Pi Dashboard</title>
+<style>
+  :root {
+    --bg: #0d1117; --card: #161b22; --line: #30363d;
+    --text: #e6edf3; --muted: #8b949e; --accent: #3fb950; --warn: #d29922; --hot: #f85149;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; min-height: 100vh; background: var(--bg); color: var(--text);
+    font: 16px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    padding: 24px;
+  }
+  header { display: flex; justify-content: space-between; align-items: baseline; flex-wrap: wrap; gap: 8px; margin-bottom: 20px; }
+  h1 { margin: 0; font-size: 28px; letter-spacing: -0.5px; }
+  h1 span { color: var(--accent); }
+  #clock { font-variant-numeric: tabular-nums; color: var(--muted); font-size: 22px; }
+  .badge { font-size: 12px; padding: 2px 8px; border-radius: 99px; background: var(--warn); color: #000; margin-left: 8px; vertical-align: middle; }
+  .grid { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 18px; }
+  .label { color: var(--muted); font-size: 13px; text-transform: uppercase; letter-spacing: 1px; }
+  .big { font-size: 44px; font-weight: 700; font-variant-numeric: tabular-nums; margin-top: 6px; }
+  .sub { color: var(--muted); font-size: 14px; }
+  .bar { height: 10px; background: var(--line); border-radius: 99px; overflow: hidden; margin-top: 12px; }
+  .bar > div { height: 100%; background: var(--accent); width: 0; transition: width .4s; }
+  .level { position: relative; width: 180px; height: 180px; margin: 10px auto 0; border-radius: 50%;
+           border: 2px solid var(--line); background: radial-gradient(circle, #1f2a36 0 30%, transparent 31%); }
+  .level::before, .level::after { content: ""; position: absolute; background: var(--line); }
+  .level::before { left: 50%; top: 0; bottom: 0; width: 1px; }
+  .level::after { top: 50%; left: 0; right: 0; height: 1px; }
+  #bubble { position: absolute; width: 34px; height: 34px; border-radius: 50%; left: 73px; top: 73px;
+            background: var(--accent); box-shadow: 0 0 18px var(--accent); transition: left .1s linear, top .1s linear; z-index: 1; }
+  .wide { grid-column: span 2; }
+  @media (max-width: 560px) { .wide { grid-column: auto; } }
+  #pico[hidden] { display: none; }
+  .row { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 12px; align-items: center; }
+  button { font: inherit; padding: 10px 16px; border-radius: 10px; border: 1px solid var(--line);
+           background: #21262d; color: var(--text); cursor: pointer; }
+  button.on { background: var(--accent); color: #000; border-color: var(--accent); }
+  .led { width: 26px; height: 26px; border-radius: 50%; background: #333; transition: all .2s; }
+  .led.on { background: #ffd33d; box-shadow: 0 0 22px #ffd33d; }
+  #err { color: var(--hot); font-size: 13px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Pixel<span>·</span>Pi <span id="demo" class="badge" hidden>DEMO</span></h1>
+  <div id="clock"></div>
+</header>
+
+<div class="grid">
+  <div class="card">
+    <div class="label">Battery</div>
+    <div class="big" id="batt">–</div>
+    <div class="sub" id="battSub"></div>
+    <div class="bar"><div id="battBar"></div></div>
+  </div>
+  <div class="card">
+    <div class="label">Temperature</div>
+    <div class="big" id="temp">–</div>
+    <div class="sub">battery sensor</div>
+  </div>
+  <div class="card">
+    <div class="label">Room light</div>
+    <div class="big" id="lux">–</div>
+    <div class="sub" id="luxSub">lux</div>
+  </div>
+  <div class="card">
+    <div class="label">Memory</div>
+    <div class="big" id="mem">–</div>
+    <div class="sub" id="memSub"></div>
+    <div class="bar"><div id="memBar"></div></div>
+  </div>
+  <div class="card">
+    <div class="label">Bubble level: tilt the phone</div>
+    <div class="level"><div id="bubble"></div></div>
+    <div class="sub" id="tilt" style="text-align:center;margin-top:8px"></div>
+  </div>
+  <div class="card" id="pico" hidden>
+    <div class="label">Pico W LED</div>
+    <div class="row">
+      <div class="led" id="led"></div>
+      <button id="ledBtn">Toggle</button>
+      <button id="autoBtn">Auto: follow room</button>
+    </div>
+    <div class="sub" style="margin-top:10px">Auto mode turns the LED on when the room gets dark.</div>
+    <div id="err"></div>
+  </div>
+  <div class="card">
+    <div class="label">Server uptime</div>
+    <div class="big" id="up">–</div>
+  </div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+let pico = {};
+
+function fmtUptime(s) {
+  const h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60);
+  return h ? `${h}h ${m}m` : `${m}m ${s % 60}s`;
+}
+
+function render(s) {
+  $("demo").hidden = !s.demo;
+  const b = s.battery || {};
+  if (b.percentage != null) {
+    $("batt").textContent = b.percentage + "%";
+    $("battBar").style.width = b.percentage + "%";
+    $("battSub").textContent = (b.status || "").toLowerCase() + (b.health ? " · " + b.health.toLowerCase() : "");
+  }
+  if (b.temperature != null) {
+    $("temp").textContent = b.temperature.toFixed(1) + "°C";
+    $("temp").style.color = b.temperature > 40 ? "var(--hot)" : b.temperature > 35 ? "var(--warn)" : "";
+  }
+  if (s.lux != null) {
+    $("lux").textContent = Math.round(s.lux);
+    $("luxSub").textContent = "lux · " + (s.lux < 15 ? "dark 🌙" : s.lux < 200 ? "indoor 💡" : "bright ☀️");
+  }
+  const m = s.memory || {};
+  if (m.total_mb) {
+    $("mem").textContent = (m.used_mb / 1024).toFixed(1) + " GB";
+    $("memSub").textContent = "of " + (m.total_mb / 1024).toFixed(1) + " GB";
+    $("memBar").style.width = (100 * m.used_mb / m.total_mb) + "%";
+  }
+  const [x, y] = s.accel || [0, 0];
+  const clamp = v => Math.max(-1, Math.min(1, v / 9.8));
+  // Bubble floats opposite to gravity's pull, like a real spirit level.
+  $("bubble").style.left = (73 + clamp(x) * 73) + "px";
+  $("bubble").style.top = (73 - clamp(y) * 73) + "px";
+  $("tilt").textContent = `x ${x.toFixed(1)}  y ${y.toFixed(1)} m/s²`;
+  $("up").textContent = fmtUptime(s.uptime || 0);
+
+  pico = s.pico || {};
+  $("pico").hidden = !pico.enabled;
+  $("led").classList.toggle("on", !!pico.on);
+  $("autoBtn").classList.toggle("on", !!pico.auto);
+  $("err").textContent = pico.error ? "Pico: " + pico.error : "";
+}
+
+async function tick() {
+  try {
+    render(await (await fetch("/api/stats")).json());
+  } catch (e) { /* server restarting; try again next tick */ }
+  setTimeout(tick, 200);
+}
+
+async function led(body) {
+  await fetch("/api/led", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+}
+$("ledBtn").onclick = () => led({ on: !pico.on });
+$("autoBtn").onclick = () => led({ auto: !pico.auto });
+
+setInterval(() => $("clock").textContent = new Date().toLocaleTimeString(), 1000);
+tick();
+</script>
+</body>
+</html>
