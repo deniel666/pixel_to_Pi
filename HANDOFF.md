@@ -9,12 +9,39 @@ Setup: Pixel 7 Pro (Android 17) is connected to the Mac by USB, and
 `adb devices` shows it as `device`. scrcpy is running in a Terminal tab, so
 don't touch that tab. Termux on the phone has this repo at `~/pixel_to_Pi`.
 
-## Before you start (the user does this on the phone, in Termux)
+## Task 0: type into Termux for the user (no SSH needed)
+
+`adb shell input text` types into whatever app is on screen, so keep **Termux
+open and in front** on the phone. Define this helper in your Mac shell. Avoid
+`&`, `;`, `|`, `$` and quotes in the typed text:
 
 ```sh
-passwd   # same password twice
-sshd
+t() { adb shell "input text '$(printf %s "$1" | sed 's/ /%s/g')'"; adb shell input keyevent 66; sleep 1; }
 ```
+
+First stop the old dashboard (Ctrl+C in Termux), then set the SSH password.
+Pick a simple letters-and-digits password, tell the user what it is, and type
+the **same** value both times:
+
+```sh
+adb shell input keycombination 113 31   # Ctrl+C
+t "passwd"
+t "PICKED_PASSWORD"
+t "PICKED_PASSWORD"
+t "sshd"
+```
+
+Also pull the latest code and restart the dashboard in the foreground. The new
+version logs what `termux-sensor` actually prints instead of crashing:
+
+```sh
+t "cd ~/pixel_to_Pi"
+t "git pull"
+t "cd projects/dashboard"
+t "python server.py"
+```
+
+Tasks 2 and 3 below then just confirm this over SSH.
 
 ## Task 1: connect to the phone over USB
 
