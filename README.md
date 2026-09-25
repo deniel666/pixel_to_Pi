@@ -4,6 +4,8 @@ Use a spare Pixel 7 Pro as the always-available voice and rendering device in th
 
 **Status:** feasibility and implementation brief; no application code or hardware integration has been tested in this repository.
 
+> **Just want to tinker tonight?** See [TINKER.md](TINKER.md): Termux setup, a live sensor dashboard for a big monitor, and a Pico W you can control from the phone over Wi-Fi. It's a warm-up for the ESP32 + Wi-Fi display link described below.
+
 ## Finding
 
 **Yes, the Pixel can replace the Raspberry Pi's role.** In the article, the Raspberry Pi runs the voice service and renderer. A separate ESP32-based controller running WLED-MM drives the 128 × 64 HUB75 panel. The Pi sends rendered RGB frames to that controller over the local network using DDP. Replacing the Pi therefore does **not** mean connecting a bare HUB75 panel directly to the phone. [Source: OpenAI build article](https://developers.openai.com/blog/bringing-my-led-display-to-life).

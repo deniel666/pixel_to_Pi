@@ -1,0 +1,293 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pixel Voice</title>
+<style>
+  :root { --bg: #0d1117; --card: #161b22; --line: #30363d; --text: #e6edf3; --muted: #8b949e;
+          --accent: #3fb950; --wait: #58a6ff; --hot: #f85149; }
+  * { box-sizing: border-box; }
+  body { margin: 0; min-height: 100vh; background: var(--bg); color: var(--text);
+         font: 18px/1.5 system-ui, sans-serif; padding: 16px; user-select: none; -webkit-user-select: none; }
+  main { max-width: 640px; margin: 0 auto; text-align: center; }
+  #orb { width: 160px; height: 160px; border-radius: 50%; margin: 24px auto; background: #21262d;
+         border: 2px solid var(--line); transition: transform .08s, box-shadow .2s, background .2s; }
+  #orb.waiting { background: radial-gradient(circle at 35% 35%, #a5d6ff, var(--wait)); box-shadow: 0 0 24px var(--wait);
+                 animation: breathe 3s ease-in-out infinite; }
+  #orb.on { background: radial-gradient(circle at 35% 35%, #7ee787, var(--accent)); box-shadow: 0 0 40px var(--accent); animation: none; }
+  @keyframes breathe { 50% { transform: scale(.92); opacity: .7; } }
+  button { font: inherit; font-size: 20px; padding: 14px 24px; border-radius: 14px; border: 0;
+           background: var(--accent); color: #000; margin: 4px; }
+  button.alt { background: var(--wait); }
+  button.stop { background: var(--hot); color: #fff; }
+  #status { color: var(--muted); margin-top: 8px; font-size: 20px; }
+  #err { color: var(--hot); margin-top: 8px; white-space: pre-wrap; text-align: left; font-size: 14px; }
+  #log { text-align: left; margin-top: 16px; }
+  #log p { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 8px 12px; margin: 6px 0; }
+  details { color: var(--muted); font-size: 13px; text-align: left; margin-top: 16px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>🎙️ Pixel Voice</h1>
+  <p>Turn on the wake word, then say <b>«Привет, Пиксель»</b>.
+     Say <b>«Пока, Пиксель»</b> to end the conversation, or just stop talking for a while.</p>
+  <div id="orb"></div>
+  <button id="wake" class="alt">👂 Wake word: off</button>
+  <button id="go">Talk now</button>
+  <button id="stop" class="stop" hidden>Stop</button>
+  <div id="status">Idle</div>
+  <div id="err"></div>
+  <div id="log"></div>
+  <details><summary>Event types seen (for debugging)</summary><div id="types"></div></details>
+</main>
+<audio id="speaker" autoplay></audio>
+<script>
+const $ = id => document.getElementById(id);
+const WAKE = /пиксел|pixel/i;                                       // "Привет, Пиксель", "Hey Pixel", …
+const BYE = /(пока|стоп|спасибо)[,.!\s]*пиксел|(bye|stop)[,.!\s]*pixel/i;
+const IDLE_SECONDS = 45;  // no speech from either side: hang up to stop paying for silence
+
+let pc = null, mic = null, meterTimer = null, idleTimer = null, busy = false;
+let wakeOn = false, recog = null;
+const buffers = {};          // partial transcript text per speaker
+const typesSeen = new Set();
+
+// ---------- sounds ----------
+let audioCtx = null;
+function tones(freqs, len = 0.12, type = "sine") {
+  audioCtx ??= new AudioContext();
+  let t = audioCtx.currentTime;
+  for (const f of freqs) {
+    const o = audioCtx.createOscillator(), g = audioCtx.createGain();
+    o.type = type;
+    o.frequency.value = f;
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(0.35, t + 0.02);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + len);
+    o.connect(g).connect(audioCtx.destination);
+    o.start(t);
+    o.stop(t + len + 0.02);
+    t += len * 0.9;
+  }
+}
+const chime = {
+  wake:  () => tones([523, 659, 784]),             // rising: "I heard you, starting"
+  ready: () => tones([1047], 0.25),                // ding: "connected, talk now"
+  bye:   () => tones([784, 659, 523]),             // falling: "going to sleep"
+  error: () => tones([196, 185], 0.3, "square"),   // low buzz: "something broke"
+};
+
+// ---------- status / transcript ----------
+function status(s) {
+  $("status").textContent = s;
+  report({ status: s });
+}
+function report(body) {
+  fetch("/api/voice", { method: "POST", headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify(body) }).catch(() => {});
+}
+function addLine(who, text) {
+  text = text.trim();
+  if (!text) return;
+  const p = document.createElement("p");
+  p.textContent = `${who} ${text}`;
+  $("log").prepend(p);
+  report({ line: `${who} ${text}` });
+}
+
+function armIdle() {
+  clearTimeout(idleTimer);
+  idleTimer = setTimeout(() => stop("💤 Went to sleep (silence)"), IDLE_SECONDS * 1000);
+}
+
+// Transcripts stream as session.input_transcript.delta (user) and
+// session.output_transcript.delta (assistant) with no "turn finished" event, so a
+// line is flushed when the other side starts talking or after a short silence.
+const flushTimers = {};
+function flush(who) {
+  clearTimeout(flushTimers[who]);
+  if (buffers[who]) addLine(who, buffers[who]);
+  if (who === "👤" && BYE.test(buffers[who] || "")) setTimeout(() => stop("👋 Bye"), 1200);
+  buffers[who] = "";
+}
+function onTranscript(who, text) {
+  armIdle();
+  const other = who === "👤" ? "🤖" : "👤";
+  if (buffers[other]) flush(other);
+  buffers[who] = (buffers[who] || "") + text;
+  clearTimeout(flushTimers[who]);
+  flushTimers[who] = setTimeout(() => flush(who), 1500);
+}
+
+function onEvent(raw) {
+  let ev;
+  try { ev = JSON.parse(raw); } catch { return; }
+  const type = String(ev.type || "unknown");
+  if (!typesSeen.has(type)) {
+    typesSeen.add(type);
+    $("types").textContent = [...typesSeen].join("\n");
+  }
+  if (type === "session.started") {
+    chime.ready();
+    armIdle();
+    status("Listening. Go ahead and talk");
+  } else if (type === "session.delegation.created") {
+    status("🔎 Looking it up…");
+  } else if (type === "error" || type.endsWith(".error") || (ev.error && type !== "response.event")) {
+    $("err").textContent = JSON.stringify(ev.error || ev, null, 2);
+  }
+  if (typeof ev.delta === "string") {
+    if (type === "session.input_transcript.delta") onTranscript("👤", ev.delta);
+    else if (type === "session.output_transcript.delta") onTranscript("🤖", ev.delta);
+  }
+}
+
+// Make the orb pulse with the assistant's voice.
+function meter(stream) {
+  audioCtx ??= new AudioContext();
+  const an = audioCtx.createAnalyser();
+  audioCtx.createMediaStreamSource(stream).connect(an);
+  const buf = new Uint8Array(an.fftSize);
+  meterTimer = setInterval(() => {
+    an.getByteTimeDomainData(buf);
+    let peak = 0;
+    for (const v of buf) peak = Math.max(peak, Math.abs(v - 128));
+    $("orb").style.transform = `scale(${1 + peak / 160})`;
+  }, 60);
+}
+
+// ---------- GPT-Live session ----------
+async function start() {
+  if (busy) return;
+  busy = true;
+  stopWakeListener();  // free the microphone for the call
+  $("err").textContent = "";
+  $("go").hidden = true;
+  $("stop").hidden = false;
+  chime.wake();
+  status("🚀 Starting…");
+  try {
+    mic = await navigator.mediaDevices.getUserMedia({ audio: true });
+    pc = new RTCPeerConnection();
+    pc.addTrack(mic.getTracks()[0], mic);
+    pc.ontrack = e => { $("speaker").srcObject = e.streams[0]; meter(e.streams[0]); };
+    const dc = pc.createDataChannel("oai-events");
+    dc.onmessage = e => onEvent(e.data);
+    pc.ondatachannel = e => { e.channel.onmessage = m => onEvent(m.data); };
+    pc.onconnectionstatechange = () => {
+      if (["failed", "disconnected"].includes(pc?.connectionState)) stop("Disconnected", true);
+    };
+
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    status("🚀 Connecting to GPT-Live…");
+    const res = await fetch("/api/live", { method: "POST", headers: { "Content-Type": "application/json" },
+                                           body: JSON.stringify({ sdp: offer.sdp }) });
+    const data = await res.json().catch(() => ({}));
+    if (res.status === 404) {
+      throw new Error("The dashboard server running on the phone is an old version without the voice API. " +
+                      "Restart it: bash ~/pixel_to_Pi/scripts/restart-dashboard.sh");
+    }
+    if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+    await pc.setRemoteDescription({ type: "answer", sdp: data.sdp });
+    try { await navigator.wakeLock?.request("screen"); } catch {}
+    $("orb").className = "on";
+    status("Starting session…");  // becomes "Listening" on session.started
+  } catch (e) {
+    $("err").textContent = String(e.message || e);
+    stop("Error", true);
+  }
+}
+
+function stop(why = "Stopped", failed = false) {
+  if (!busy) return;
+  busy = false;
+  clearTimeout(idleTimer);
+  clearInterval(meterTimer);
+  flush("👤");
+  flush("🤖");
+  (failed ? chime.error : chime.bye)();
+  $("orb").style.transform = "";
+  mic?.getTracks().forEach(t => t.stop());
+  mic = null;
+  if (pc) {
+    pc.close();
+    pc = null;
+    fetch("/api/live/hangup", { method: "POST", body: "{}" }).catch(() => {});
+  }
+  $("stop").hidden = true;
+  $("go").hidden = false;
+  status(why);
+  if (wakeOn) setTimeout(startWakeListener, 1500);
+  else $("orb").className = "";
+}
+
+// ---------- wake word ----------
+// Chrome's speech recognition listens for the phrase. On Android it stops every
+// few seconds, so it's restarted in a loop. It can't share the mic with the
+// call, so it pauses while a session runs.
+const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+
+function startWakeListener() {
+  if (!wakeOn || busy || recog) return;
+  recog = new Recognition();
+  recog.lang = "ru-RU";
+  recog.continuous = true;
+  recog.interimResults = true;
+  recog.onresult = e => {
+    for (let i = e.resultIndex; i < e.results.length; i++) {
+      if (WAKE.test(e.results[i][0].transcript)) {
+        addLine("👂", e.results[i][0].transcript);
+        start();
+        return;
+      }
+    }
+  };
+  recog.onerror = e => {
+    if (e.error === "not-allowed") {
+      $("err").textContent = "Microphone permission denied for speech recognition.";
+      setWake(false);
+    }
+  };
+  recog.onend = () => {
+    recog = null;
+    if (wakeOn && !busy) setTimeout(startWakeListener, 250);
+  };
+  try { recog.start(); } catch { recog = null; }
+  $("orb").className = "waiting";
+  status("👂 Waiting for «Привет, Пиксель»");
+}
+
+function stopWakeListener() {
+  if (recog) {
+    recog.onend = null;
+    recog.abort();
+    recog = null;
+  }
+}
+
+function setWake(on) {
+  wakeOn = on;
+  $("wake").textContent = on ? "👂 Wake word: on" : "👂 Wake word: off";
+  if (on) {
+    tones([659], 0.1);  // also unlocks audio playback for later chimes
+    startWakeListener();
+  } else {
+    stopWakeListener();
+    if (!busy) { $("orb").className = ""; status("Idle"); }
+  }
+}
+
+if (!Recognition) {
+  $("wake").disabled = true;
+  $("wake").textContent = "👂 Wake word not supported in this browser";
+}
+$("wake").onclick = () => setWake(!wakeOn);
+$("go").onclick = start;
+$("stop").onclick = () => stop();
+window.addEventListener("pagehide", () => stop());
+</script>
+</body>
+</html>
