@@ -74,5 +74,23 @@ open http://localhost:8000
 **Report back** the output of `server.log`. It shows either
 `[live Termux:API]` or `[DEMO mode ...]`.
 
+## Task 4: sensors through the phone's browser
+
+This Termux is the Google Play build, which has no working Termux:API for
+sensors, so the phone's Chrome sends the motion sensor instead. The dashboard
+is running in the Termux foreground:
+
+```sh
+ssh -p 8022 localhost 'cd ~/pixel_to_Pi && git pull && git log --oneline -1'
+adb shell input keycombination 113 31   # Ctrl+C: stop the dashboard (Termux must be in front)
+t "python server.py"
+adb shell am start -a android.intent.action.VIEW -d http://localhost:8000/sensors.html
+open http://localhost:8000
+```
+
+Then the user taps **Start** on the phone page. Its status should read
+`Sending ✓ (N)` with N growing, and tilting the phone moves the bubble on the
+Mac dashboard. Keep that Chrome tab on the phone screen. Report the status line.
+
 If you lose the connection (cable unplugged or adb restarted), re-run the two
 `adb forward` lines.

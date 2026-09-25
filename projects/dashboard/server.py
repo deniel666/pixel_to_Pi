@@ -85,8 +85,8 @@ def stream_sensors():
     accel_name, light_name = pick_sensors()
     wanted = ",".join(n for n in (accel_name, light_name) if n)
     if not wanted:
-        print("No accelerometer/light sensor found; sensor tiles stay empty. "
-              "Check that `termux-sensor -l` lists sensors.")
+        print("No sensors from Termux:API. Instead, open "
+              f"http://localhost:{PORT}/sensors.html in Chrome on the phone.")
         return
     print(f"Streaming sensors: {wanted}")
     decoder = json.JSONDecoder()
@@ -191,12 +191,25 @@ class Handler(SimpleHTTPRequestHandler):
         return super().do_GET()
 
     def do_POST(self):
+        length = int(self.headers.get("Content-Length", 0))
+        try:
+            req = json.loads(self.rfile.read(length) or "{}")
+        except ValueError:
+            return self.send_json({"error": "bad json"}, 400)
+        if self.path == "/api/motion":
+            # Sent by sensors.html in the phone's browser: a fallback for when
+            # Termux:API can't read sensors (e.g. the Google Play build of Termux).
+            with lock:
+                accel = req.get("accel")
+                if isinstance(accel, list) and len(accel) >= 3:
+                    state["accel"] = [float(v) for v in accel[:3]]
+                if isinstance(req.get("lux"), (int, float)):
+                    state["lux"] = float(req["lux"])
+            return self.send_json({"ok": True})
         if self.path != "/api/led":
             return self.send_json({"error": "not found"}, 404)
         if not PICO_URL:
             return self.send_json({"error": "start the server with PICO_URL set"}, 400)
-        length = int(self.headers.get("Content-Length", 0))
-        req = json.loads(self.rfile.read(length) or "{}")
         with lock:
             if "auto" in req:
                 state["pico"]["auto"] = bool(req["auto"])
