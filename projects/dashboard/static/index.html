@@ -90,6 +90,12 @@
     <div class="sub" style="margin-top:10px">Auto mode turns the LED on when the room gets dark.</div>
     <div id="err"></div>
   </div>
+  <div class="card wide" id="voiceCard">
+    <div class="label">🎙️ Pixel voice · <span id="voiceStatus">idle</span></div>
+    <div id="voiceLines" class="sub" style="font-size:18px;color:var(--text);margin-top:10px"></div>
+    <div id="voiceErr" style="color:var(--hot);font-size:13px;margin-top:6px"></div>
+    <div class="sub" id="voiceHint">Open <b>localhost:8000/voice.html</b> in Chrome on the phone and tap Start.</div>
+  </div>
   <div class="card">
     <div class="label">Server uptime</div>
     <div class="big" id="up">–</div>
@@ -134,6 +140,21 @@ function render(s) {
   $("bubble").style.top = (73 - clamp(y) * 73) + "px";
   $("tilt").textContent = `x ${x.toFixed(1)}  y ${y.toFixed(1)} m/s²`;
   $("up").textContent = fmtUptime(s.uptime || 0);
+
+  const v = s.voice || {};
+  $("voiceStatus").textContent = v.status || "idle";
+  $("voiceHint").hidden = (v.lines || []).length > 0;
+  $("voiceErr").textContent = v.error || "";
+  const lines = (v.lines || []).slice(-4);
+  if ($("voiceLines").dataset.n !== lines.join("\n")) {
+    $("voiceLines").dataset.n = lines.join("\n");
+    $("voiceLines").replaceChildren(...lines.map(t => {
+      const d = document.createElement("div");
+      d.textContent = t;
+      d.style.margin = "4px 0";
+      return d;
+    }));
+  }
 
   pico = s.pico || {};
   $("pico").hidden = !pico.enabled;

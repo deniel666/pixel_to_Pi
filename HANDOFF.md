@@ -92,5 +92,30 @@ Then the user taps **Start** on the phone page. Its status should read
 `Sending ✓ (N)` with N growing, and tilting the phone moves the bubble on the
 Mac dashboard. Keep that Chrome tab on the phone screen. Report the status line.
 
+## Task 5: GPT-Live voice assistant
+
+The phone's dashboard server brokers GPT-Live sessions, so the OpenAI key
+stays on the phone. The user gives you their OpenAI API key. Write it **without
+putting it on a command line or in chat**:
+
+```sh
+pbpaste | ssh -p 8022 localhost 'umask 077; cat > ~/.openai_key'   # after the user copies the key
+ssh -p 8022 localhost 'wc -c < ~/.openai_key'                      # just the length, never the key
+```
+
+Then update and restart, as in Task 4:
+
+```sh
+ssh -p 8022 localhost 'cd ~/pixel_to_Pi && git pull && git log --oneline -1'
+adb shell input keycombination 113 31   # Ctrl+C in Termux (Termux in front)
+t "python server.py"
+adb shell am start -a android.intent.action.VIEW -d http://localhost:8000/voice.html
+```
+
+The user taps **Start**, allows the microphone, and talks. Transcripts appear
+on the Mac dashboard. **Report back**: the status and red error text on the
+phone page (if any), the "Event types seen" list (expand it at the bottom),
+and any `GPT-Live session ...` lines the dashboard printed in Termux.
+
 If you lose the connection (cable unplugged or adb restarted), re-run the two
 `adb forward` lines.

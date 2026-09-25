@@ -1,0 +1,159 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pixel Voice</title>
+<style>
+  :root { --bg: #0d1117; --card: #161b22; --line: #30363d; --text: #e6edf3; --muted: #8b949e;
+          --accent: #3fb950; --hot: #f85149; }
+  * { box-sizing: border-box; }
+  body { margin: 0; min-height: 100vh; background: var(--bg); color: var(--text);
+         font: 18px/1.5 system-ui, sans-serif; padding: 16px; user-select: none; -webkit-user-select: none; }
+  main { max-width: 640px; margin: 0 auto; text-align: center; }
+  #orb { width: 160px; height: 160px; border-radius: 50%; margin: 24px auto; background: #21262d;
+         border: 2px solid var(--line); transition: transform .08s, box-shadow .2s, background .2s; }
+  #orb.on { background: radial-gradient(circle at 35% 35%, #7ee787, var(--accent)); box-shadow: 0 0 40px var(--accent); }
+  button { font: inherit; font-size: 22px; padding: 14px 28px; border-radius: 14px; border: 0;
+           background: var(--accent); color: #000; margin: 4px; }
+  button.stop { background: var(--hot); color: #fff; }
+  #status { color: var(--muted); margin-top: 8px; }
+  #err { color: var(--hot); margin-top: 8px; white-space: pre-wrap; text-align: left; font-size: 14px; }
+  #log { text-align: left; margin-top: 16px; }
+  #log p { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 8px 12px; margin: 6px 0; }
+  details { color: var(--muted); font-size: 13px; text-align: left; margin-top: 16px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>🎙️ Pixel Voice</h1>
+  <p>Tap Start, allow the microphone, and just talk. Interrupting works.</p>
+  <div id="orb"></div>
+  <button id="go">Start</button>
+  <button id="stop" class="stop" hidden>Stop</button>
+  <div id="status">Idle</div>
+  <div id="err"></div>
+  <div id="log"></div>
+  <details><summary>Event types seen (for debugging)</summary><div id="types"></div></details>
+</main>
+<audio id="speaker" autoplay></audio>
+<script>
+const $ = id => document.getElementById(id);
+let pc = null, mic = null, meterTimer = null;
+const buffers = {};          // partial transcript text, keyed by event type stem
+const typesSeen = new Set();
+
+function status(s) {
+  $("status").textContent = s;
+  report({ status: s });
+}
+function report(body) {
+  fetch("/api/voice", { method: "POST", headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify(body) }).catch(() => {});
+}
+function addLine(who, text) {
+  text = text.trim();
+  if (!text) return;
+  const p = document.createElement("p");
+  p.textContent = `${who} ${text}`;
+  $("log").prepend(p);
+  report({ line: `${who} ${text}` });
+}
+
+// The Live event schema is new, so read transcripts generically: collect any
+// streamed text fields, and flush them when a matching done/completed event arrives.
+function onEvent(raw) {
+  let ev;
+  try { ev = JSON.parse(raw); } catch { return; }
+  const type = String(ev.type || "unknown");
+  if (!typesSeen.has(type)) {
+    typesSeen.add(type);
+    $("types").textContent = [...typesSeen].join("\n");
+  }
+  if (type.includes("error")) {
+    $("err").textContent = JSON.stringify(ev.error || ev, null, 2);
+  }
+  const who = /input|user/.test(type) ? "👤" : "🤖";
+  const stem = type.replace(/\.(delta|append|done|completed)$/, "");
+  const piece = typeof ev.delta === "string" ? ev.delta : null;
+  if (piece) buffers[stem] = (buffers[stem] || "") + piece;
+  if (/\.(done|completed)$/.test(type)) {
+    const full = typeof ev.transcript === "string" ? ev.transcript
+               : typeof ev.text === "string" ? ev.text : buffers[stem];
+    if (full) addLine(who, full);
+    delete buffers[stem];
+  }
+}
+
+function watchChannel(dc) {
+  dc.onmessage = e => onEvent(e.data);
+}
+
+// Make the orb pulse with the assistant's voice.
+function meter(stream) {
+  const ctx = new AudioContext();
+  const an = ctx.createAnalyser();
+  ctx.createMediaStreamSource(stream).connect(an);
+  const buf = new Uint8Array(an.fftSize);
+  meterTimer = setInterval(() => {
+    an.getByteTimeDomainData(buf);
+    let peak = 0;
+    for (const v of buf) peak = Math.max(peak, Math.abs(v - 128));
+    $("orb").style.transform = `scale(${1 + peak / 160})`;
+  }, 60);
+}
+
+async function start() {
+  $("err").textContent = "";
+  $("go").hidden = true;
+  status("Asking for the microphone…");
+  try {
+    mic = await navigator.mediaDevices.getUserMedia({ audio: true });
+    pc = new RTCPeerConnection();
+    pc.addTrack(mic.getTracks()[0], mic);
+    pc.ontrack = e => { $("speaker").srcObject = e.streams[0]; meter(e.streams[0]); };
+    watchChannel(pc.createDataChannel("oai-events"));
+    pc.ondatachannel = e => watchChannel(e.channel);
+    pc.onconnectionstatechange = () => {
+      if (["failed", "disconnected", "closed"].includes(pc?.connectionState)) stop("Disconnected");
+    };
+
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    status("Connecting to GPT-Live…");
+    const res = await fetch("/api/live", { method: "POST", headers: { "Content-Type": "application/json" },
+                                           body: JSON.stringify({ sdp: offer.sdp }) });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+    await pc.setRemoteDescription({ type: "answer", sdp: data.sdp });
+    try { await navigator.wakeLock?.request("screen"); } catch {}
+    $("orb").classList.add("on");
+    $("stop").hidden = false;
+    status("Listening. Go ahead and talk");
+  } catch (e) {
+    $("err").textContent = String(e.message || e);
+    stop("Error");
+  }
+}
+
+function stop(why = "Stopped") {
+  clearInterval(meterTimer);
+  $("orb").classList.remove("on");
+  $("orb").style.transform = "";
+  mic?.getTracks().forEach(t => t.stop());
+  if (pc) {
+    pc.close();
+    pc = null;
+    fetch("/api/live/hangup", { method: "POST", body: "{}" }).catch(() => {});
+  }
+  $("stop").hidden = true;
+  $("go").hidden = false;
+  status(why);
+}
+
+$("go").onclick = start;
+$("stop").onclick = () => stop();
+window.addEventListener("pagehide", () => stop());
+</script>
+</body>
+</html>

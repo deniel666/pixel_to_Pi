@@ -20,6 +20,8 @@ import urllib.request
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+import live
+
 PORT = int(os.environ.get("PORT", "8000"))
 PICO_URL = os.environ.get("PICO_URL", "").rstrip("/")
 DARK_LUX = float(os.environ.get("DARK_LUX", "15"))
@@ -33,6 +35,8 @@ state = {
     "memory": {},
     "uptime": 0,
     "pico": {"enabled": bool(PICO_URL), "on": False, "auto": False, "error": None},
+    # GPT-Live voice assistant, driven from voice.html in the phone's browser.
+    "voice": {"status": "idle", "session": "", "error": None, "lines": []},
 }
 lock = threading.Lock()
 started = time.time()
@@ -182,6 +186,20 @@ class Handler(SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def start_live(self, offer):
+        """Broker the WebRTC offer to OpenAI; the API key never leaves the phone."""
+        if not offer:
+            return self.send_json({"error": "missing sdp"}, 400)
+        try:
+            sid, answer = live.create_session(offer)
+        except live.LiveError as e:
+            with lock:
+                state["voice"].update(status="error", error=str(e))
+            return self.send_json({"error": str(e)}, 502)
+        with lock:
+            state["voice"].update(status="connected", session=sid, error=None)
+        return self.send_json({"sdp": answer, "session": sid})
+
     def do_GET(self):
         if self.path == "/api/stats":
             with lock:
@@ -196,6 +214,23 @@ class Handler(SimpleHTTPRequestHandler):
             req = json.loads(self.rfile.read(length) or "{}")
         except ValueError:
             return self.send_json({"error": "bad json"}, 400)
+        if self.path == "/api/live":
+            return self.start_live(req.get("sdp", ""))
+        if self.path == "/api/live/hangup":
+            with lock:
+                sid = state["voice"]["session"]
+                state["voice"].update(status="idle", session="")
+            live.hangup(sid)
+            return self.send_json({"ok": True})
+        if self.path == "/api/voice":
+            # Transcript lines and status from voice.html, shown on the big-screen dashboard.
+            with lock:
+                v = state["voice"]
+                if req.get("status"):
+                    v["status"] = str(req["status"])[:40]
+                if req.get("line"):
+                    v["lines"] = (v["lines"] + [str(req["line"])[:500]])[-8:]
+            return self.send_json({"ok": True})
         if self.path == "/api/motion":
             # Sent by sensors.html in the phone's browser: a fallback for when
             # Termux:API can't read sensors (e.g. the Google Play build of Termux).
