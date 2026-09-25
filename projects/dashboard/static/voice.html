@@ -185,7 +185,11 @@ async function start() {
     status("🚀 Connecting to GPT-Live…");
     const res = await fetch("/api/live", { method: "POST", headers: { "Content-Type": "application/json" },
                                            body: JSON.stringify({ sdp: offer.sdp }) });
-    const data = await res.json();
+    const data = await res.json().catch(() => ({}));
+    if (res.status === 404) {
+      throw new Error("The dashboard server running on the phone is an old version without the voice API. " +
+                      "Restart it: bash ~/pixel_to_Pi/scripts/restart-dashboard.sh");
+    }
     if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
     await pc.setRemoteDescription({ type: "answer", sdp: data.sdp });
     try { await navigator.wakeLock?.request("screen"); } catch {}

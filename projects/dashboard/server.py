@@ -242,7 +242,7 @@ class Handler(SimpleHTTPRequestHandler):
                     state["lux"] = float(req["lux"])
             return self.send_json({"ok": True})
         if self.path != "/api/led":
-            return self.send_json({"error": "not found"}, 404)
+            return self.send_json({"error": f"not found: {self.path}"}, 404)
         if not PICO_URL:
             return self.send_json({"error": "start the server with PICO_URL set"}, 400)
         with lock:

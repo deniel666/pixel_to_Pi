@@ -103,14 +103,18 @@ pbpaste | ssh -p 8022 localhost 'umask 077; cat > ~/.openai_key'   # after the u
 ssh -p 8022 localhost 'wc -c < ~/.openai_key'                      # just the length, never the key
 ```
 
-Then update and restart, as in Task 4:
+Then update and restart. **Always restart with the script.** Ctrl+C in Termux
+can leave the old server on port 8000, and then the voice page shows
+`not found`:
 
 ```sh
-ssh -p 8022 localhost 'cd ~/pixel_to_Pi && git pull && git log --oneline -1'
-adb shell input keycombination 113 31   # Ctrl+C in Termux (Termux in front)
-t "python server.py"
+ssh -p 8022 localhost 'cd ~/pixel_to_Pi && git pull -q && bash scripts/restart-dashboard.sh'
 adb shell am start -a android.intent.action.VIEW -d http://localhost:8000/voice.html
 ```
+
+The script must end with `--- OK: voice API is live`. Server logs are
+readable at any time with
+`ssh -p 8022 localhost 'cat ~/pixel_to_Pi/projects/dashboard/server.log'`.
 
 The user taps **👂 Wake word** once (allow the microphone), then says
 **«Привет, Пиксель»** (rising chime = starting, ding = ready) and talks.
@@ -118,7 +122,7 @@ The user taps **👂 Wake word** once (allow the microphone), then says
 A low buzz means an error. Transcripts appear
 on the Mac dashboard. **Report back**: the status and red error text on the
 phone page (if any), the "Event types seen" list (expand it at the bottom),
-and any `GPT-Live session ...` lines the dashboard printed in Termux.
+and any `GPT-Live session ...` lines in `server.log`.
 
 If you lose the connection (cable unplugged or adb restarted), re-run the two
 `adb forward` lines.
