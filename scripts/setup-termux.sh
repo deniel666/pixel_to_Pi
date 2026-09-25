@@ -22,8 +22,8 @@ termux-setup-storage || true
 
 echo "==> SSH server"
 if [ ! -f "$PREFIX/etc/ssh/.pixel_to_pi_pw" ]; then
-  echo "Set a password for SSH logins:"
-  passwd
+  echo "Set a password for SSH logins (typing is invisible, that's normal):"
+  until passwd; do echo "Passwords didn't match, try again."; done
   touch "$PREFIX/etc/ssh/.pixel_to_pi_pw"
 fi
 pgrep -x sshd >/dev/null || sshd

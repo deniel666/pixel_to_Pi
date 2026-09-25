@@ -24,10 +24,9 @@ PORT = int(os.environ.get("PORT", "8000"))
 PICO_URL = os.environ.get("PICO_URL", "").rstrip("/")
 DARK_LUX = float(os.environ.get("DARK_LUX", "15"))
 STATIC = Path(__file__).parent / "static"
-DEMO = shutil.which("termux-battery-status") is None
 
 state = {
-    "demo": DEMO,
+    "demo": False,
     "battery": {},
     "accel": [0.0, 0.0, 9.8],
     "lux": None,
@@ -40,8 +39,23 @@ started = time.time()
 
 
 def run_json(*cmd, timeout=15):
-    out = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout).stdout
-    return json.loads(out) if out.strip() else {}
+    """Run a termux-* command and parse its JSON; {} if it fails or prints non-JSON."""
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return {}
+    try:
+        return json.loads(out) if out.strip() else {}
+    except ValueError:
+        print(f"{cmd[0]} printed non-JSON output: {out.strip()[:200]!r}")
+        return {}
+
+
+def termux_api_works():
+    """The termux-api package can be installed while the Termux:API app is missing."""
+    if shutil.which("termux-battery-status") is None:
+        return False
+    return "percentage" in run_json("termux-battery-status", timeout=10)
 
 
 def read_memory():
@@ -71,7 +85,8 @@ def stream_sensors():
     accel_name, light_name = pick_sensors()
     wanted = ",".join(n for n in (accel_name, light_name) if n)
     if not wanted:
-        print("No accelerometer/light sensor found; sensor tiles stay empty.")
+        print("No accelerometer/light sensor found; sensor tiles stay empty. "
+              "Check that `termux-sensor -l` lists sensors.")
         return
     print(f"Streaming sensors: {wanted}")
     decoder = json.JSONDecoder()
@@ -192,13 +207,19 @@ class Handler(SimpleHTTPRequestHandler):
 
 
 def main():
-    workers = [demo_loop] if DEMO else [stream_sensors, poll_slow]
+    demo = not termux_api_works()
+    state["demo"] = demo
+    workers = [demo_loop] if demo else [stream_sensors, poll_slow]
     if PICO_URL:
         workers.append(auto_led_loop)
     for fn in workers:
         threading.Thread(target=fn, daemon=True).start()
 
-    mode = "DEMO mode (no Termux:API found)" if DEMO else "live Termux:API"
+    mode = "live Termux:API"
+    if demo:
+        mode = "DEMO mode: Termux:API not responding"
+        if shutil.which("termux-battery-status"):
+            print("Install the Termux:API app (same source as Termux), open it once, then restart.")
     print(f"Dashboard on http://0.0.0.0:{PORT}  [{mode}]")
     if PICO_URL:
         print(f"Pico W LED at {PICO_URL}")
