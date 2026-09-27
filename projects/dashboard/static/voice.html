@@ -329,6 +329,7 @@ function stopWakeListener() {
 
 function setWake(on) {
   wakeOn = on;
+  try { localStorage.setItem("wakeOn", on ? "1" : "0"); } catch {}
   $("wake").textContent = on ? "👂 Wake word: on" : "👂 Wake word: off";
   if (on) {
     tones([659], 0.1);  // also unlocks audio playback for later chimes
@@ -343,7 +344,21 @@ if (!Recognition) {
   $("wake").disabled = true;
   $("wake").textContent = "👂 Wake word not supported in this browser";
 }
-$("wake").onclick = () => setWake(!wakeOn);
+$("wake").onclick = e => { e.stopPropagation(); setWake(!wakeOn); };
+
+// After a reload the wake word was silently off. Remember it; Chrome still needs one tap
+// before the page may use the mic and play sounds, so ask for it clearly.
+let savedWake = false;
+try { savedWake = localStorage.getItem("wakeOn") === "1"; } catch {}
+if (savedWake && Recognition) {
+  status("👆 Tap anywhere to resume listening for «Привет, Пиксель»");
+  $("status").style.cssText = "color: var(--wait); font-size: 26px; font-weight: 700";
+  document.addEventListener("click", function resume() {
+    document.removeEventListener("click", resume);
+    $("status").style.cssText = "";
+    if (!wakeOn) setWake(true);
+  });
+}
 $("go").onclick = start;
 $("stop").onclick = () => stop();
 window.addEventListener("pagehide", () => stop("Page closed"));

@@ -192,8 +192,15 @@ def linear_update_issue(issue_id, state="", comment="", title="", priority=None)
 # ---------- registry ----------
 
 def _fn(name, description, properties, required=()):
-    return {"type": "function", "name": name, "description": description,
-            "parameters": {"type": "object", "properties": properties, "required": list(required),
+    """Strict-mode schema: every property is listed as required, and optional ones accept null."""
+    props = {}
+    for key, spec in properties.items():
+        spec = dict(spec)
+        if key not in required:
+            spec["type"] = [spec["type"], "null"]
+        props[key] = spec
+    return {"type": "function", "name": name, "description": description, "strict": True,
+            "parameters": {"type": "object", "properties": props, "required": list(properties),
                            "additionalProperties": False}}
 
 
@@ -222,7 +229,7 @@ TOOLS = {
         _fn("linear_search_issues", "Find ErzyCall Linear issues by title text, newest activity first. "
             "Empty query lists recently updated issues.",
             {"query": {"type": "string"}, "limit": {"type": "integer"}}),
-        lambda a: linear_search_issues(a.get("query", ""), a.get("limit", 10)),
+        lambda a: linear_search_issues(a.get("query") or "", a.get("limit") or 10),
         "linear",
     ),
     "linear_create_issue": (
@@ -232,8 +239,8 @@ TOOLS = {
              "description": {"type": "string", "description": "Markdown: context, acceptance criteria, repro steps"},
              "priority": {"type": "integer", "description": "0 none, 1 urgent, 2 high, 3 medium, 4 low"}},
             ["title", "kind"]),
-        lambda a: linear_create_issue(a["title"], a.get("kind", "feature"), a.get("description", ""),
-                                      a.get("priority", 0)),
+        lambda a: linear_create_issue(a["title"], a.get("kind") or "feature", a.get("description") or "",
+                                      a.get("priority") or 0),
         "linear",
     ),
     "linear_update_issue": (
@@ -242,8 +249,8 @@ TOOLS = {
             {"issue_id": {"type": "string"}, "state": {"type": "string", "description": "e.g. Todo, In Progress, Done"},
              "comment": {"type": "string"}, "title": {"type": "string"}, "priority": {"type": "integer"}},
             ["issue_id"]),
-        lambda a: linear_update_issue(a["issue_id"], a.get("state", ""), a.get("comment", ""),
-                                      a.get("title", ""), a.get("priority")),
+        lambda a: linear_update_issue(a["issue_id"], a.get("state") or "", a.get("comment") or "",
+                                      a.get("title") or "", a.get("priority")),
         "linear",
     ),
 }

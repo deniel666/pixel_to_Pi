@@ -160,5 +160,15 @@ Quick voice checks: "What's the weather?", "Any news about OpenAI today?",
 "How many calls did we have this week?", and "Create a bug: calls drop after
 60 seconds". It should read the bug back and ask for a yes before creating it.
 
+## When something doesn't work: diagnose first
+
+```sh
+ssh -p 8022 localhost 'cd ~/pixel_to_Pi && git pull -q && bash scripts/restart-dashboard.sh && bash scripts/diagnose.sh'
+adb exec-out screencap -p > phone.png   # screenshot of the phone's screen
+```
+
+Send back the full output plus what the voice page shows (status line, red text,
+last ⏹/⚠️ lines). It prints no secrets.
+
 If you lose the connection (cable unplugged or adb restarted), re-run the two
 `adb forward` lines.
