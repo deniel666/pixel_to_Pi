@@ -21,6 +21,7 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import live
+import tools
 
 PORT = int(os.environ.get("PORT", "8000"))
 PICO_URL = os.environ.get("PICO_URL", "").rstrip("/")
@@ -36,7 +37,7 @@ state = {
     "uptime": 0,
     "pico": {"enabled": bool(PICO_URL), "on": False, "auto": False, "error": None},
     # GPT-Live voice assistant, driven from voice.html in the phone's browser.
-    "voice": {"status": "idle", "session": "", "error": None, "lines": []},
+    "voice": {"status": "idle", "session": "", "mode": "", "tools": [], "error": None, "lines": []},
 }
 lock = threading.Lock()
 started = time.time()
@@ -191,14 +192,20 @@ class Handler(SimpleHTTPRequestHandler):
         if not offer:
             return self.send_json({"error": "missing sdp"}, 400)
         try:
-            sid, answer = live.create_session(offer)
+            sid, answer, mode = live.create_session(offer)
         except live.LiveError as e:
             with lock:
                 state["voice"].update(status="error", error=str(e))
             return self.send_json({"error": str(e)}, 502)
+        has_tools = mode.startswith("responses")
         with lock:
-            state["voice"].update(status="connected", session=sid, error=None)
-        return self.send_json({"sdp": answer, "session": sid})
+            state["voice"].update(status="connected", session=sid, mode=mode, error=None,
+                                  tools=["web_search", *tools.enabled_tools()] if has_tools else [])
+        return self.send_json({"sdp": answer, "session": sid, "mode": mode})
+
+    def from_phone(self):
+        # adb-forwarded connections from the Mac also arrive as 127.0.0.1.
+        return self.client_address[0] in ("127.0.0.1", "::1")
 
     def do_GET(self):
         if self.path == "/api/stats":
@@ -206,6 +213,8 @@ class Handler(SimpleHTTPRequestHandler):
                 state["memory"] = read_memory()
                 state["uptime"] = int(time.time() - started)
                 return self.send_json(state)
+        if self.path == "/api/tools":
+            return self.send_json({"enabled": tools.enabled_tools()})
         return super().do_GET()
 
     def do_POST(self):
@@ -214,8 +223,20 @@ class Handler(SimpleHTTPRequestHandler):
             req = json.loads(self.rfile.read(length) or "{}")
         except ValueError:
             return self.send_json({"error": "bad json"}, 400)
+        if self.path in ("/api/live", "/api/tool") and not self.from_phone():
+            # These spend money or change Linear, so only the phone itself may call them.
+            return self.send_json({"error": "only allowed from the phone (localhost)"}, 403)
         if self.path == "/api/live":
             return self.start_live(req.get("sdp", ""))
+        if self.path == "/api/tool":
+            name = str(req.get("name", ""))
+            output = tools.run(name, req.get("arguments", "{}"))
+            ok = '"error"' not in output[:200]
+            print(f"tool {name}: {'ok' if ok else output[:300]}")
+            with lock:
+                v = state["voice"]
+                v["lines"] = (v["lines"] + [f"🔧 {name}: {'done' if ok else 'failed'}"])[-10:]
+            return self.send_json({"output": output})
         if self.path == "/api/live/hangup":
             with lock:
                 sid = state["voice"]["session"]
@@ -229,7 +250,7 @@ class Handler(SimpleHTTPRequestHandler):
                 if req.get("status"):
                     v["status"] = str(req["status"])[:40]
                 if req.get("line"):
-                    v["lines"] = (v["lines"] + [str(req["line"])[:500]])[-8:]
+                    v["lines"] = (v["lines"] + [str(req["line"])[:500]])[-10:]
             return self.send_json({"ok": True})
         if self.path == "/api/motion":
             # Sent by sensors.html in the phone's browser: a fallback for when

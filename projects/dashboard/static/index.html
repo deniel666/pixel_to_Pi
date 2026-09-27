@@ -142,10 +142,11 @@ function render(s) {
   $("up").textContent = fmtUptime(s.uptime || 0);
 
   const v = s.voice || {};
-  $("voiceStatus").textContent = v.status || "idle";
+  $("voiceStatus").textContent = (v.status || "idle") +
+    (v.session ? (v.tools?.length ? ` · tools: ${v.tools.join(", ")}` : " · ⚠️ no tools this session") : "");
   $("voiceHint").hidden = (v.lines || []).length > 0;
   $("voiceErr").textContent = v.error || "";
-  const lines = (v.lines || []).slice(-4);
+  const lines = (v.lines || []).slice(-6);
   if ($("voiceLines").dataset.n !== lines.join("\n")) {
     $("voiceLines").dataset.n = lines.join("\n");
     $("voiceLines").replaceChildren(...lines.map(t => {

@@ -124,5 +124,41 @@ on the Mac dashboard. **Report back**: the status and red error text on the
 phone page (if any), the "Event types seen" list (expand it at the bottom),
 and any `GPT-Live session ...` lines in `server.log`.
 
+## Task 6: tools (weather, search, PostHog, Linear)
+
+Weather and web search need no setup. PostHog and Linear need keys on the phone.
+The user copies each value to the Mac clipboard, one at a time, and you pipe it
+in. **Never put a key on a command line or in chat.**
+
+```sh
+S='python ~/pixel_to_Pi/scripts/set_secret.py'
+# PostHog: Settings → Personal API keys → new key with "Query: read" scope
+pbpaste | ssh -p 8022 localhost "$S posthog.api_key"
+# PostHog project ID (Settings → Project) and host (us or eu cloud): not secret
+echo 12345 | ssh -p 8022 localhost "$S posthog.project_id"
+echo https://us.posthog.com | ssh -p 8022 localhost "$S posthog.host"
+# Linear: Settings → Security & access → Personal API keys
+pbpaste | ssh -p 8022 localhost "$S linear.api_key"
+# Linear team key: the prefix of issue IDs, e.g. ERZ in ERZ-42
+echo ERZ | ssh -p 8022 localhost "$S linear.team_key"
+ssh -p 8022 localhost "$S --show"    # values are masked
+```
+
+Then update and restart, and confirm which tools are on:
+
+```sh
+ssh -p 8022 localhost 'cd ~/pixel_to_Pi && git pull -q && bash scripts/restart-dashboard.sh'
+curl -s localhost:8000/api/tools
+```
+
+Expect `get_weather`, `posthog_query`, and the three `linear_*` tools. On the
+Mac dashboard, the voice card lists the session's tools. If it says
+**"⚠️ no tools this session"**, OpenAI refused the tool setup. Send back the
+`GPT-Live session create failed` lines from `server.log`.
+
+Quick voice checks: "What's the weather?", "Any news about OpenAI today?",
+"How many calls did we have this week?", and "Create a bug: calls drop after
+60 seconds". It should read the bug back and ask for a yes before creating it.
+
 If you lose the connection (cable unplugged or adb restarted), re-run the two
 `adb forward` lines.

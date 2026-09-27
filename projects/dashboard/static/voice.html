@@ -47,9 +47,13 @@
 const $ = id => document.getElementById(id);
 const WAKE = /пиксел|pixel/i;                                       // "Привет, Пиксель", "Hey Pixel", …
 const BYE = /(пока|стоп|спасибо)[,.!\s]*пиксел|(bye|stop)[,.!\s]*pixel/i;
-const IDLE_SECONDS = 45;  // no speech from either side: hang up to stop paying for silence
+// Hang up after this much silence (no speech, no tool work) to stop paying for an idle line.
+// Brainstorms have pauses, so the default is generous; override with voice.html?idle=600.
+const IDLE_SECONDS = Number(new URLSearchParams(location.search).get("idle")) || 180;
 
 let pc = null, mic = null, meterTimer = null, idleTimer = null, busy = false;
+let channel = null;          // data channel the session's events arrive on; replies go back on it
+const pendingCalls = {};     // delegation_id -> function calls the backend is waiting on
 let wakeOn = false, recog = null;
 const buffers = {};          // partial transcript text per speaker
 const typesSeen = new Set();
@@ -99,7 +103,8 @@ function addLine(who, text) {
 
 function armIdle() {
   clearTimeout(idleTimer);
-  idleTimer = setTimeout(() => stop("💤 Went to sleep (silence)"), IDLE_SECONDS * 1000);
+  idleTimer = setTimeout(() => stop(`💤 Went to sleep after ${Math.round(IDLE_SECONDS / 60)} min of silence`),
+                         IDLE_SECONDS * 1000);
 }
 
 // Transcripts stream as session.input_transcript.delta (user) and
@@ -129,18 +134,64 @@ function onEvent(raw) {
     typesSeen.add(type);
     $("types").textContent = [...typesSeen].join("\n");
   }
+  if (type === "response.event") return onBackendEvent(ev);
   if (type === "session.started") {
     chime.ready();
     armIdle();
     status("Listening. Go ahead and talk");
   } else if (type === "session.delegation.created") {
     status("🔎 Looking it up…");
-  } else if (type === "error" || type.endsWith(".error") || (ev.error && type !== "response.event")) {
-    $("err").textContent = JSON.stringify(ev.error || ev, null, 2);
+  } else if (type === "error" || type.endsWith(".error") || ev.error) {
+    const msg = JSON.stringify(ev.error || ev, null, 2);
+    $("err").textContent = msg;
+    addLine("⚠️", msg.slice(0, 300));
   }
   if (typeof ev.delta === "string") {
     if (type === "session.input_transcript.delta") onTranscript("👤", ev.delta);
     else if (type === "session.output_transcript.delta") onTranscript("🤖", ev.delta);
+  }
+}
+
+// ---------- backend function calls ----------
+// With Responses delegation, backend events arrive wrapped in response.event. When the backend
+// calls one of our functions, we run it on the phone's server (which holds the keys), send each
+// result back as a function_call_output item, then ask the backend to continue.
+function send(obj) {
+  if (channel?.readyState === "open") channel.send(JSON.stringify(obj));
+}
+
+async function onBackendEvent(env) {
+  const e = env.event || {};
+  const did = env.delegation_id || "none";
+  armIdle();  // backend work counts as activity
+  if (e.type === "response.output_item.done" && e.item?.type === "function_call") {
+    (pendingCalls[did] ??= []).push(e.item);
+  } else if (["response.completed", "response.done", "response.incomplete"].includes(e.type)) {
+    const calls = pendingCalls[did] || [];
+    delete pendingCalls[did];
+    if (!calls.length) return;
+    status(`🔧 ${calls.map(c => c.name).join(", ")}…`);
+    const outputs = await Promise.all(calls.map(runTool));
+    calls.forEach((c, i) => send({
+      type: "response.item.create",
+      event_id: `tool_${c.call_id}`,
+      item: { type: "function_call_output", call_id: c.call_id, output: outputs[i] },
+    }));
+    send({ type: "response.create", event_id: `continue_${Date.now()}` });
+    status("🔎 Working on it…");
+  } else if (e.type === "error" || e.type === "response.failed") {
+    addLine("⚠️", `backend: ${JSON.stringify(e.error || e.response?.error || e).slice(0, 300)}`);
+  }
+}
+
+async function runTool(call) {
+  try {
+    const res = await fetch("/api/tool", { method: "POST", headers: { "Content-Type": "application/json" },
+                                           body: JSON.stringify({ name: call.name, arguments: call.arguments }) });
+    const data = await res.json();
+    return data.output ?? JSON.stringify({ error: data.error || `HTTP ${res.status}` });
+  } catch (err) {
+    return JSON.stringify({ error: `tool call failed: ${err.message || err}` });
   }
 }
 
@@ -173,11 +224,14 @@ async function start() {
     pc = new RTCPeerConnection();
     pc.addTrack(mic.getTracks()[0], mic);
     pc.ontrack = e => { $("speaker").srcObject = e.streams[0]; meter(e.streams[0]); };
-    const dc = pc.createDataChannel("oai-events");
-    dc.onmessage = e => onEvent(e.data);
-    pc.ondatachannel = e => { e.channel.onmessage = m => onEvent(m.data); };
+    const listen = ch => { ch.onmessage = m => { channel = ch; onEvent(m.data); }; };
+    channel = pc.createDataChannel("oai-events");
+    listen(channel);
+    pc.ondatachannel = e => listen(e.channel);
     pc.onconnectionstatechange = () => {
-      if (["failed", "disconnected"].includes(pc?.connectionState)) stop("Disconnected", true);
+      if (["failed", "disconnected"].includes(pc?.connectionState)) {
+        stop(`Connection to OpenAI ${pc.connectionState} (network drop or session ended by OpenAI)`, true);
+      }
     };
 
     const offer = await pc.createOffer();
@@ -192,6 +246,10 @@ async function start() {
     }
     if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
     await pc.setRemoteDescription({ type: "answer", sdp: data.sdp });
+    if (!String(data.mode || "").startsWith("responses")) {
+      addLine("⚠️", `No search or tools this session (OpenAI accepted only the "${data.mode}" setup). ` +
+                    "See server.log for why delegation was refused.");
+    }
     try { await navigator.wakeLock?.request("screen"); } catch {}
     $("orb").className = "on";
     status("Starting session…");  // becomes "Listening" on session.started
@@ -208,6 +266,7 @@ function stop(why = "Stopped", failed = false) {
   clearInterval(meterTimer);
   flush("👤");
   flush("🤖");
+  addLine("⏹", why);  // shows on the dashboard too, so "it stopped" comes with a reason
   (failed ? chime.error : chime.bye)();
   $("orb").style.transform = "";
   mic?.getTracks().forEach(t => t.stop());
@@ -287,7 +346,10 @@ if (!Recognition) {
 $("wake").onclick = () => setWake(!wakeOn);
 $("go").onclick = start;
 $("stop").onclick = () => stop();
-window.addEventListener("pagehide", () => stop());
+window.addEventListener("pagehide", () => stop("Page closed"));
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden && busy) addLine("⚠️", "Voice page left the screen; Android may cut the mic. Keep it in front.");
+});
 </script>
 </body>
 </html>
