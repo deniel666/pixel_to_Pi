@@ -130,17 +130,22 @@ function onEvent(raw) {
   let ev;
   try { ev = JSON.parse(raw); } catch { return; }
   const type = String(ev.type || "unknown");
-  if (!typesSeen.has(type)) {
-    typesSeen.add(type);
+  const inner = type === "response.event" ? `response.event/${ev.event?.type}` : type;
+  if (!typesSeen.has(inner)) {
+    typesSeen.add(inner);
     $("types").textContent = [...typesSeen].join("\n");
   }
+  logEvent(inner, raw);
   if (type === "response.event") return onBackendEvent(ev);
+  // In case function calls arrive unwrapped.
+  if (type.startsWith("response.function_call") || ev.item?.type === "function_call") return onBackendEvent(ev);
   if (type === "session.started") {
     chime.ready();
     armIdle();
     status("Listening. Go ahead and talk");
   } else if (type === "session.delegation.created") {
     status("🔎 Looking it up…");
+    watchBackend();
   } else if (type === "error" || type.endsWith(".error") || ev.error) {
     const msg = JSON.stringify(ev.error || ev, null, 2);
     $("err").textContent = msg;
@@ -160,28 +165,85 @@ function send(obj) {
   if (channel?.readyState === "open") channel.send(JSON.stringify(obj));
 }
 
-async function onBackendEvent(env) {
-  const e = env.event || {};
-  const did = env.delegation_id || "none";
-  armIdle();  // backend work counts as activity
-  if (e.type === "response.output_item.done" && e.item?.type === "function_call") {
-    (pendingCalls[did] ??= []).push(e.item);
-  } else if (["response.completed", "response.done", "response.incomplete"].includes(e.type)) {
-    const calls = pendingCalls[did] || [];
-    delete pendingCalls[did];
-    if (!calls.length) return;
-    status(`🔧 ${calls.map(c => c.name).join(", ")}…`);
-    const outputs = await Promise.all(calls.map(runTool));
-    calls.forEach((c, i) => send({
-      type: "response.item.create",
-      event_id: `tool_${c.call_id}`,
-      item: { type: "function_call_output", call_id: c.call_id, output: outputs[i] },
-    }));
-    send({ type: "response.create", event_id: `continue_${Date.now()}` });
-    status("🔎 Working on it…");
-  } else if (e.type === "error" || e.type === "response.failed") {
-    addLine("⚠️", `backend: ${JSON.stringify(e.error || e.response?.error || e).slice(0, 300)}`);
+// Every event goes to server.log (deltas only once per type, they're noisy), so a stalled
+// tool call can be debugged from the Mac without the phone's screen.
+const loggedDeltas = new Set();
+function logEvent(type, raw) {
+  if (type.endsWith(".delta")) {
+    if (loggedDeltas.has(type)) return;
+    loggedDeltas.add(type);
   }
+  report({ event: raw.length > 1500 ? raw.slice(0, 1500) + "…" : raw });
+}
+
+// If a delegation goes quiet, say so on screen and in the log instead of hanging silently.
+let backendTimer = null;
+function watchBackend() {
+  clearTimeout(backendTimer);
+  backendTimer = setTimeout(() => {
+    const waiting = Object.values(pendingCalls).flat().map(c => c.name);
+    addLine("⚠️", waiting.length ? `backend still waiting after 30 s; unsent tool calls: ${waiting.join(", ")}`
+                                  : "backend silent for 30 s (no tool call or answer arrived)");
+  }, 30000);
+}
+
+// The exact event shapes for function calls aren't pinned down, so collect them from every
+// place they can appear: a finished output item, finished arguments, or the completed
+// response's output list. Each call_id runs once.
+const doneCalls = new Set();
+const callNames = {};        // item id -> function name, from response.output_item.added
+function collectCall(did, item) {
+  if (!item || !item.call_id || doneCalls.has(item.call_id)) return;
+  const list = (pendingCalls[did] ??= []);
+  const known = list.find(c => c.call_id === item.call_id);
+  if (known) Object.assign(known, Object.fromEntries(Object.entries(item).filter(([, v]) => v)));
+  else list.push({ ...item });
+}
+
+let flushCallsTimer = null;
+async function onBackendEvent(env) {
+  const e = env.event || env;
+  const did = env.delegation_id || e.delegation_id || "none";
+  armIdle();  // backend work counts as activity
+  watchBackend();
+  const t = String(e.type || "");
+  if (t === "response.output_item.added" && e.item?.type === "function_call") {
+    callNames[e.item.id] = e.item.name;
+    collectCall(did, e.item);
+  } else if (t === "response.output_item.done" && e.item?.type === "function_call") {
+    collectCall(did, e.item);
+  } else if (t === "response.function_call_arguments.done") {
+    collectCall(did, { call_id: e.call_id, name: e.name || callNames[e.item_id], arguments: e.arguments });
+  } else if (["response.completed", "response.done", "response.incomplete"].includes(t)) {
+    for (const item of e.response?.output || []) if (item.type === "function_call") collectCall(did, item);
+    return runPendingCalls(did);
+  } else if (t === "error" || t === "response.failed") {
+    addLine("⚠️", `backend: ${JSON.stringify(e.error || e.response?.error || e).slice(0, 300)}`);
+    return;
+  }
+  // Fallback if no completion event ever arrives for a response that asked for a tool.
+  if (pendingCalls[did]?.length) {
+    clearTimeout(flushCallsTimer);
+    flushCallsTimer = setTimeout(() => runPendingCalls(did), 4000);
+  }
+}
+
+async function runPendingCalls(did) {
+  clearTimeout(flushCallsTimer);
+  const calls = (pendingCalls[did] || []).filter(c => c.name && !doneCalls.has(c.call_id));
+  delete pendingCalls[did];
+  if (!calls.length) return clearTimeout(backendTimer);  // response finished without a tool call
+  calls.forEach(c => doneCalls.add(c.call_id));
+  status(`🔧 ${calls.map(c => c.name).join(", ")}…`);
+  const outputs = await Promise.all(calls.map(runTool));
+  calls.forEach((c, i) => send({
+    type: "response.item.create",
+    event_id: `tool_${c.call_id}`,
+    item: { type: "function_call_output", call_id: c.call_id, output: outputs[i] },
+  }));
+  send({ type: "response.create", event_id: `continue_${Date.now()}` });
+  report({ line: `🔧 sent ${calls.length} tool result(s) back, asked the backend to continue` });
+  status("🔎 Working on it…");
 }
 
 async function runTool(call) {
@@ -263,6 +325,8 @@ function stop(why = "Stopped", failed = false) {
   if (!busy) return;
   busy = false;
   clearTimeout(idleTimer);
+  clearTimeout(backendTimer);
+  clearTimeout(flushCallsTimer);
   clearInterval(meterTimer);
   flush("👤");
   flush("🤖");

@@ -9,7 +9,7 @@ if ! python ../../scripts/stop_dashboard.py; then
 fi
 
 termux-wake-lock 2>/dev/null
-nohup python server.py > server.log 2>&1 &
+nohup python -u server.py > server.log 2>&1 &
 sleep 3
 echo "--- commit: $(git log --oneline -1)"
 echo "--- server.log:"

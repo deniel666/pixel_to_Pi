@@ -14,6 +14,7 @@ import os
 import random
 import shutil
 import subprocess
+import sys
 import threading
 import time
 import urllib.request
@@ -27,6 +28,8 @@ PORT = int(os.environ.get("PORT", "8000"))
 PICO_URL = os.environ.get("PICO_URL", "").rstrip("/")
 DARK_LUX = float(os.environ.get("DARK_LUX", "15"))
 STATIC = Path(__file__).parent / "static"
+# Under nohup stdout is a file, so Python buffers it and server.log stays empty. Flush every line.
+sys.stdout.reconfigure(line_buffering=True)
 
 state = {
     "demo": False,
@@ -245,11 +248,14 @@ class Handler(SimpleHTTPRequestHandler):
             return self.send_json({"ok": True})
         if self.path == "/api/voice":
             # Transcript lines and status from voice.html, shown on the big-screen dashboard.
+            if req.get("event"):  # raw GPT-Live event, for debugging tool calls in server.log
+                print(f"event {str(req['event'])[:1500]}")
             with lock:
                 v = state["voice"]
                 if req.get("status"):
                     v["status"] = str(req["status"])[:40]
                 if req.get("line"):
+                    print(f"voice {str(req['line'])[:300]}")
                     v["lines"] = (v["lines"] + [str(req["line"])[:500]])[-10:]
             return self.send_json({"ok": True})
         if self.path == "/api/motion":
