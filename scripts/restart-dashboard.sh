@@ -3,10 +3,9 @@
 # Usage (from the Mac): ssh -p 8022 localhost 'bash ~/pixel_to_Pi/scripts/restart-dashboard.sh'
 cd "$(dirname "$0")/../projects/dashboard" || exit 1
 
-pkill -f "^python3? server.py" && sleep 1
-if pgrep -f "^python3? server.py" >/dev/null; then
-  pkill -9 -f "^python3? server.py"
-  sleep 1
+if ! python ../../scripts/stop_dashboard.py; then
+  echo "--- PROBLEM: could not free port 8000; not starting a second server."
+  exit 1
 fi
 
 termux-wake-lock 2>/dev/null
@@ -15,8 +14,10 @@ sleep 3
 echo "--- commit: $(git log --oneline -1)"
 echo "--- server.log:"
 cat server.log
-if curl -s -XPOST localhost:8000/api/live -d '{}' | grep -q "missing sdp"; then
-  echo "--- OK: voice API is live"
+# /api/tools only exists in the current version, so an old server can't pass this.
+if curl -s -m 5 localhost:8000/api/tools | grep -q '"enabled"'; then
+  echo "--- OK: current server is running. Tools: $(curl -s -m 5 localhost:8000/api/tools)"
 else
-  echo "--- PROBLEM: /api/live not answering. Old server still on port 8000?"
+  echo "--- PROBLEM: the current server is not the one answering on port 8000."
+  exit 1
 fi
