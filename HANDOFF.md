@@ -151,14 +151,14 @@ ssh -p 8022 localhost 'cd ~/pixel_to_Pi && git pull -q && bash scripts/restart-d
 curl -s localhost:8000/api/tools
 ```
 
-Expect `get_weather`, `posthog_query`, and the three `linear_*` tools. On the
+Expect `get_weather`, `posthog_query`, and five `linear_*` tools (lookup, search, create, update, delete). On the
 Mac dashboard, the voice card lists the session's tools. If it says
 **"⚠️ no tools this session"**, OpenAI refused the tool setup. Send back the
 `GPT-Live session create failed` lines from `server.log`.
 
 Quick voice checks: "What's the weather?", "Any news about OpenAI today?",
 "How many calls did we have this week?", and "Create a bug: calls drop after
-60 seconds". It should read the bug back and ask for a yes before creating it.
+60 seconds, assign it to Artur, project <name>". It should read the bug back (with assignee and project) and ask for a yes before creating it. "Delete ERZ-<n>" moves an issue to Linear's trash after a yes.
 
 ## When something doesn't work: diagnose first
 

@@ -117,24 +117,93 @@ def _team_id():
     return nodes[0]["id"]
 
 
-ISSUE_FIELDS = "identifier title url priority state{name} assignee{name} labels{nodes{name}} updatedAt"
+ISSUE_FIELDS = "identifier title url priority state{name} assignee{name} project{name} labels{nodes{name}} updatedAt"
 
 
 def _issue_summary(i):
     return {"id": i["identifier"], "title": i["title"], "state": (i.get("state") or {}).get("name"),
-            "assignee": (i.get("assignee") or {}).get("name"), "priority": i.get("priority"),
+            "assignee": (i.get("assignee") or {}).get("name"), "project": (i.get("project") or {}).get("name"),
+            "priority": i.get("priority"),
             "labels": [l["name"] for l in (i.get("labels") or {}).get("nodes", [])], "url": i.get("url")}
 
 
-def linear_search_issues(query="", limit=10):
+def linear_search_issues(query="", limit=10, project="", assignee=""):
     limit = max(1, min(int(limit or 10), 25))
     team = load_config().get("linear", {}).get("team_key", "")
     flt = {"team": {"key": {"eq": team}}}
     if query:
         flt["title"] = {"containsIgnoreCase": query}
+    if project:
+        flt["project"] = {"name": {"containsIgnoreCase": project}}
+    if assignee:
+        flt["assignee"] = ({"isMe": {"eq": True}} if assignee.lower() == "me"
+                           else {"or": [{"name": {"containsIgnoreCase": assignee}},
+                                        {"displayName": {"containsIgnoreCase": assignee}}]})
     data = _linear(f"query($f:IssueFilter,$n:Int){{issues(filter:$f,first:$n,orderBy:updatedAt){{nodes{{{ISSUE_FIELDS}}}}}}}",
                    {"f": flt, "n": limit})
     return {"issues": [_issue_summary(i) for i in data["issues"]["nodes"]]}
+
+
+# Words that mean "clear this field" (unassign, remove from project).
+NONE_WORDS = {"none", "nobody", "no one", "unassigned", "no project", "нет", "никто", "никого", "без проекта"}
+
+
+def _pick(nodes, wanted, what, label):
+    """One match by exact name first, then the only partial match; otherwise explain the choices."""
+    exact = [n for n in nodes if wanted.lower() in {str(v).lower() for k, v in n.items() if k != "id"}]
+    if len(exact) == 1:
+        return exact[0]
+    if len(nodes) == 1:
+        return nodes[0]
+    if not nodes:
+        raise ToolError(f"No Linear {what} matching {wanted!r}. Use linear_lookup to see the options.")
+    raise ToolError(f"{wanted!r} matches several {what}s: {', '.join(label(n) for n in nodes[:10])}. Ask which one.")
+
+
+def _user_id(who):
+    """Linear user id for a name, display name, email or "me"; None means unassign."""
+    who = (who or "").strip()
+    if who.lower() in NONE_WORDS:
+        return None
+    if who.lower() in ("me", "я", "мне", "меня"):
+        return _linear("query{viewer{id}}")["viewer"]["id"]
+    nodes = _linear("query($q:String!){users(filter:{active:{eq:true},or:[{name:{containsIgnoreCase:$q}},"
+                    "{displayName:{containsIgnoreCase:$q}},{email:{eqIgnoreCase:$q}}]}){nodes{id name displayName email}}}",
+                    {"q": who})["users"]["nodes"]
+    return _pick(nodes, who, "user", lambda n: n["name"])["id"]
+
+
+def _project_id(name):
+    """Linear project id by (part of) its name; None means remove from any project."""
+    name = (name or "").strip()
+    if name.lower() in NONE_WORDS:
+        return None
+    nodes = _linear("query($q:String!){projects(filter:{name:{containsIgnoreCase:$q}},first:20){nodes{id name}}}",
+                    {"q": name})["projects"]["nodes"]
+    return _pick(nodes, name, "project", lambda n: n["name"])["id"]
+
+
+def linear_lookup():
+    """Projects and people the assistant can use for assignee/project, so it can offer real names."""
+    data = _linear("query{viewer{name} projects(first:50,orderBy:updatedAt){nodes{name status{name}}}"
+                   " users(filter:{active:{eq:true}}){nodes{name displayName email}}}")
+    return {
+        "me": data["viewer"]["name"],
+        "projects": [{"name": p["name"], "status": (p.get("status") or {}).get("name")}
+                     for p in data["projects"]["nodes"]],
+        "people": [{"name": u["name"], "display_name": u.get("displayName"), "email": u.get("email")}
+                   for u in data["users"]["nodes"]],
+    }
+
+
+def _issue_uuid(issue_id):
+    try:
+        issue = _linear("query($id:String!){issue(id:$id){id identifier title team{id}}}", {"id": issue_id})["issue"]
+    except ToolError as e:  # Linear answers an unknown ID with an error, not null
+        raise ToolError(f"No Linear issue {issue_id!r} ({e})")
+    if not issue:
+        raise ToolError(f"No Linear issue {issue_id!r}")
+    return issue
 
 
 KIND_LABELS = {"feature": "Feature", "bug": "Bug", "test": "Test", "improvement": "Improvement"}
@@ -146,7 +215,7 @@ def _label_id(team_id, name):
     return (nodes["issueLabels"]["nodes"] or [{}])[0].get("id")
 
 
-def linear_create_issue(title, kind="feature", description="", priority=0):
+def linear_create_issue(title, kind="feature", description="", priority=0, assignee="", project=""):
     team_id = _team_id()
     label = KIND_LABELS.get((kind or "").lower(), "")
     body = {"teamId": team_id, "title": title.strip(),
@@ -157,18 +226,27 @@ def linear_create_issue(title, kind="feature", description="", priority=0):
         body["labelIds"] = [label_id]
     elif label:
         body["title"] = f"[{label}] {body['title']}"
+    # Resolve names before creating, so a typo fails cleanly instead of leaving a half-set issue.
+    if assignee and (uid := _user_id(assignee)):
+        body["assigneeId"] = uid
+    if project and (pid := _project_id(project)):
+        body["projectId"] = pid
     data = _linear(f"mutation($i:IssueCreateInput!){{issueCreate(input:$i){{success issue{{{ISSUE_FIELDS}}}}}}}",
                    {"i": body})
     return {"created": _issue_summary(data["issueCreate"]["issue"])}
 
 
-def linear_update_issue(issue_id, state="", comment="", title="", priority=None):
-    issue = _linear("query($id:String!){issue(id:$id){id team{id}}}", {"id": issue_id})["issue"]
+def linear_update_issue(issue_id, state="", comment="", title="", priority=None, assignee="", project=""):
+    issue = _issue_uuid(issue_id)
     changes = {}
     if title:
         changes["title"] = title
     if priority is not None:
         changes["priority"] = max(0, min(int(priority), 4))
+    if assignee:
+        changes["assigneeId"] = _user_id(assignee)     # None = unassign
+    if project:
+        changes["projectId"] = _project_id(project)    # None = remove from project
     if state:
         nodes = _linear("query($t:ID!,$n:String!){workflowStates(filter:{team:{id:{eq:$t}},name:{eqIgnoreCase:$n}})"
                         "{nodes{id name}}}", {"t": issue["team"]["id"], "n": state})["workflowStates"]["nodes"]
@@ -185,8 +263,18 @@ def linear_update_issue(issue_id, state="", comment="", title="", priority=None)
                 {"i": {"issueId": issue["id"], "body": comment}})
         result["commented"] = True
     if not result:
-        raise ToolError("Nothing to change: give a state, comment, title or priority")
+        raise ToolError("Nothing to change: give a state, comment, title, priority, assignee or project")
     return result
+
+
+def linear_delete_issue(issue_id):
+    """Moves the issue to Linear's trash (restorable there for 30 days), not a permanent delete."""
+    issue = _issue_uuid(issue_id)
+    ok = _linear("mutation($id:String!){issueDelete(id:$id){success}}", {"id": issue["id"]})["issueDelete"]["success"]
+    if not ok:
+        raise ToolError(f"Linear refused to delete {issue['identifier']}")
+    return {"deleted": issue["identifier"], "title": issue["title"],
+            "note": "Moved to Linear's trash; it can be restored there for 30 days."}
 
 
 # ---------- registry ----------
@@ -225,32 +313,57 @@ TOOLS = {
         lambda a: posthog_query(a["hogql"]),
         "posthog",
     ),
+    "linear_lookup": (
+        _fn("linear_lookup", "List ErzyCall's Linear projects and people (names, emails), plus who \"me\" is. "
+            "Call it before assigning or filing into a project when the exact name is unclear, e.g. the user "
+            "said a name in Russian.", {}),
+        lambda a: linear_lookup(),
+        "linear",
+    ),
     "linear_search_issues": (
-        _fn("linear_search_issues", "Find ErzyCall Linear issues by title text, newest activity first. "
-            "Empty query lists recently updated issues.",
-            {"query": {"type": "string"}, "limit": {"type": "integer"}}),
-        lambda a: linear_search_issues(a.get("query") or "", a.get("limit") or 10),
+        _fn("linear_search_issues", "Find ErzyCall Linear issues by title text, project and/or assignee, newest "
+            "activity first. Empty query lists recently updated issues.",
+            {"query": {"type": "string"}, "limit": {"type": "integer"},
+             "project": {"type": "string", "description": "Part of a project name"},
+             "assignee": {"type": "string", "description": "Person's name, or \"me\""}}),
+        lambda a: linear_search_issues(a.get("query") or "", a.get("limit") or 10, a.get("project") or "",
+                                       a.get("assignee") or ""),
         "linear",
     ),
     "linear_create_issue": (
-        _fn("linear_create_issue", "Create a Linear issue: a feature, bug, test or improvement." + CONFIRM,
+        _fn("linear_create_issue", "Create a Linear issue: a feature, bug, test or improvement, optionally assigned "
+            "to a person and filed in a project." + CONFIRM,
             {"title": {"type": "string"},
              "kind": {"type": "string", "enum": ["feature", "bug", "test", "improvement"]},
              "description": {"type": "string", "description": "Markdown: context, acceptance criteria, repro steps"},
-             "priority": {"type": "integer", "description": "0 none, 1 urgent, 2 high, 3 medium, 4 low"}},
+             "priority": {"type": "integer", "description": "0 none, 1 urgent, 2 high, 3 medium, 4 low"},
+             "assignee": {"type": "string", "description": "Person's name or email as in Linear, or \"me\""},
+             "project": {"type": "string", "description": "Project name as in Linear (a unique part is enough)"}},
             ["title", "kind"]),
         lambda a: linear_create_issue(a["title"], a.get("kind") or "feature", a.get("description") or "",
-                                      a.get("priority") or 0),
+                                      a.get("priority") or 0, a.get("assignee") or "", a.get("project") or ""),
         "linear",
     ),
     "linear_update_issue": (
-        _fn("linear_update_issue", "Change a Linear issue's state/title/priority and/or add a comment, by its "
-            "identifier such as ERZ-42." + CONFIRM,
+        _fn("linear_update_issue", "Change a Linear issue's state, title, priority, assignee or project and/or add a "
+            "comment, by its identifier such as ERZ-42. Use assignee \"none\" to unassign and project \"none\" "
+            "to take it out of its project." + CONFIRM,
             {"issue_id": {"type": "string"}, "state": {"type": "string", "description": "e.g. Todo, In Progress, Done"},
-             "comment": {"type": "string"}, "title": {"type": "string"}, "priority": {"type": "integer"}},
+             "comment": {"type": "string"}, "title": {"type": "string"}, "priority": {"type": "integer"},
+             "assignee": {"type": "string", "description": "Person's name or email, \"me\", or \"none\""},
+             "project": {"type": "string", "description": "Project name, or \"none\""}},
             ["issue_id"]),
         lambda a: linear_update_issue(a["issue_id"], a.get("state") or "", a.get("comment") or "",
-                                      a.get("title") or "", a.get("priority")),
+                                      a.get("title") or "", a.get("priority"), a.get("assignee") or "",
+                                      a.get("project") or ""),
+        "linear",
+    ),
+    "linear_delete_issue": (
+        _fn("linear_delete_issue", "Delete a Linear issue by its identifier such as ERZ-42 (it goes to Linear's "
+            "trash, restorable for 30 days). Use it to remove an issue created by mistake. First find it and read "
+            "back its ID and title." + CONFIRM,
+            {"issue_id": {"type": "string"}}, ["issue_id"]),
+        lambda a: linear_delete_issue(a["issue_id"]),
         "linear",
     ),
 }

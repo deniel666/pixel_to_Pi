@@ -26,9 +26,13 @@ CAPABILITIES = {
     "web_search": "Web search: news, facts, prices, anything current.",
     "get_weather": "Weather: current conditions and 3-day forecast (Kuala Lumpur unless another place is named).",
     "posthog_query": "ErzyCall analytics from PostHog: events, active users, funnels, trends.",
-    "linear_search_issues": "Linear: look up ErzyCall issues and their status.",
-    "linear_create_issue": "Linear: create feature, bug, test or improvement issues (after the user confirms).",
-    "linear_update_issue": "Linear: move, retitle, reprioritise or comment on issues (after the user confirms).",
+    "linear_lookup": "Linear: list ErzyCall's projects and people.",
+    "linear_search_issues": "Linear: look up ErzyCall issues by text, project or assignee.",
+    "linear_create_issue": "Linear: create feature, bug, test or improvement issues, with assignee and project "
+                           "(after the user confirms).",
+    "linear_update_issue": "Linear: move, retitle, reprioritise, reassign, change project or comment on issues "
+                           "(after the user confirms).",
+    "linear_delete_issue": "Linear: delete an issue created by mistake (after the user confirms).",
 }
 
 
@@ -60,7 +64,9 @@ Do not delegate to the backend when:
 - You can answer from the conversation or a still-current result.
 - You need a brief clarification to understand the request.
 
-Before any Linear create or update, say exactly what will be created or changed and ask for a yes.
+Before any Linear create, update or delete, say exactly what will be created, changed or deleted
+(including assignee and project) and ask for a yes. When creating an issue and the user hasn't said who
+it's for or which project it belongs to, ask.
 Delegate before giving an answer that depends on backend work.
 Do not guess the result while waiting.
 """)
@@ -77,7 +83,10 @@ context. If a needed detail is still unclear, ask for that detail instead of gue
 - Weather: use get_weather; default to Kuala Lumpur.
 - ErzyCall analytics: use posthog_query. First discover event names if unsure, then query. Report
   numbers with the time range they cover.
-- Linear: search before creating to avoid duplicates. Only create or update an issue when the
+- Linear: search before creating to avoid duplicates. Put every new issue in a project and give it an
+  assignee when the conversation says which; use linear_lookup to map spoken or Russian names (e.g. Артур)
+  to the exact Linear project and person names. To delete a mistaken issue, find it first and confirm its
+  ID and title; deleted issues go to Linear's trash and can be restored for 30 days. Only create or update an issue when the
   conversation shows the user explicitly said yes to that exact change; otherwise return the proposed
   change and ask for confirmation. Write clear titles, and for bugs include repro steps and expected
   versus actual behaviour; for features include acceptance criteria.
