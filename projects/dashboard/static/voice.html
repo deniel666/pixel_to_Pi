@@ -46,7 +46,8 @@
 <script>
 const $ = id => document.getElementById(id);
 const WAKE = /пиксел|pixel/i;                                       // "Привет, Пиксель", "Hey Pixel", …
-const BYE = /(пока|стоп|спасибо)[,.!\s]*пиксел|(bye|stop)[,.!\s]*pixel/i;
+// Tolerates "Пик сель": transcription can split the word, even across two lines.
+const BYE = /(пока|стоп|спасибо)[,.!\s]*пик\s*сел|(bye|stop)[,.!\s]*pix\s*el/i;
 // Hang up after this much silence (no speech, no tool work) to stop paying for an idle line.
 // Brainstorms have pauses, so the default is generous; override with voice.html?idle=600.
 const IDLE_SECONDS = Number(new URLSearchParams(location.search).get("idle")) || 180;
@@ -111,10 +112,17 @@ function armIdle() {
 // session.output_transcript.delta (assistant) with no "turn finished" event, so a
 // line is flushed when the other side starts talking or after a short silence.
 const flushTimers = {};
+let lastUser = { text: "", at: 0 };
 function flush(who) {
   clearTimeout(flushTimers[who]);
   if (buffers[who]) addLine(who, buffers[who]);
-  if (who === "👤" && BYE.test(buffers[who] || "")) setTimeout(() => stop("👋 Bye"), 1200);
+  if (who === "👤" && buffers[who]) {
+    // Check this line together with the previous one: «Пока, Пик» + «сель» must still end the call.
+    const now = Date.now(), line = buffers[who];
+    const prev = now - lastUser.at < 6000 ? lastUser.text : "";
+    if ([line, prev + line, prev + " " + line].some(t => BYE.test(t))) setTimeout(() => stop("👋 Bye"), 1200);
+    lastUser = { text: line.trim(), at: now };
+  }
   buffers[who] = "";
 }
 function onTranscript(who, text) {
