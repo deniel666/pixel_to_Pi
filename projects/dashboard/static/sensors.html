@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Phone Sensor Feed</title>
+<style>
+  :root { --bg: #0d1117; --text: #e6edf3; --muted: #8b949e; --accent: #3fb950; }
+  body { margin: 0; min-height: 100vh; background: var(--bg); color: var(--text);
+         font: 18px/1.5 system-ui, sans-serif; display: grid; place-items: center; padding: 16px; text-align: center;
+         user-select: none; -webkit-user-select: none; }  /* stops Chrome's tap-to-search popup */
+  button { font: inherit; font-size: 22px; padding: 16px 28px; border-radius: 14px; border: 0;
+           background: var(--accent); color: #000; }
+  #status { color: var(--muted); margin-top: 16px; }
+  #vals { font-variant-numeric: tabular-nums; font-size: 28px; margin-top: 8px; }
+</style>
+</head>
+<body>
+<div>
+  <h1>📡 Sensor feed</h1>
+  <p>Open this page <b>in Chrome on the phone</b>. It sends the phone's motion
+     sensor to the dashboard. Keep this tab on screen.</p>
+  <button id="go">Start</button>
+  <div id="vals"></div>
+  <div id="status">Not started</div>
+</div>
+<script>
+const $ = id => document.getElementById(id);
+let latest = null, lux = null, sent = 0;
+
+function onMotion(e) {
+  const g = e.accelerationIncludingGravity;
+  if (g && g.x != null) latest = [g.x, g.y, g.z];
+}
+
+async function start() {
+  // iOS needs explicit permission; Android Chrome grants it on a secure origin (localhost counts).
+  if (typeof DeviceMotionEvent !== "undefined" && DeviceMotionEvent.requestPermission) {
+    try { await DeviceMotionEvent.requestPermission(); } catch (e) {}
+  }
+  window.addEventListener("devicemotion", onMotion);
+  if ("AmbientLightSensor" in window) {  // behind a flag in most browsers; bonus if present
+    try { const s = new AmbientLightSensor(); s.onreading = () => lux = s.illuminance; s.start(); } catch (e) {}
+  }
+  try { await navigator.wakeLock?.request("screen"); } catch (e) {}
+  $("go").hidden = true;
+  setInterval(push, 100);
+}
+
+async function push() {
+  if (!latest) { $("status").textContent = "Waiting for motion data… (open over http://localhost)"; return; }
+  $("vals").textContent = latest.map(v => v.toFixed(1)).join("  ");
+  try {
+    await fetch("/api/motion", { method: "POST", headers: { "Content-Type": "application/json" },
+                                 body: JSON.stringify({ accel: latest, lux }) });
+    $("status").textContent = `Sending ✓ (${++sent})`;
+  } catch (e) {
+    $("status").textContent = "Can't reach the dashboard server";
+  }
+}
+
+$("go").onclick = start;
+</script>
+</body>
+</html>

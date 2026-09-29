@@ -1,0 +1,442 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pixel Voice</title>
+<style>
+  :root { --bg: #0d1117; --card: #161b22; --line: #30363d; --text: #e6edf3; --muted: #8b949e;
+          --accent: #3fb950; --wait: #58a6ff; --hot: #f85149; }
+  * { box-sizing: border-box; }
+  body { margin: 0; min-height: 100vh; background: var(--bg); color: var(--text);
+         font: 18px/1.5 system-ui, sans-serif; padding: 16px; user-select: none; -webkit-user-select: none; }
+  main { max-width: 640px; margin: 0 auto; text-align: center; }
+  #orb { width: 160px; height: 160px; border-radius: 50%; margin: 24px auto; background: #21262d;
+         border: 2px solid var(--line); transition: transform .08s, box-shadow .2s, background .2s; }
+  #orb.waiting { background: radial-gradient(circle at 35% 35%, #a5d6ff, var(--wait)); box-shadow: 0 0 24px var(--wait);
+                 animation: breathe 3s ease-in-out infinite; }
+  #orb.on { background: radial-gradient(circle at 35% 35%, #7ee787, var(--accent)); box-shadow: 0 0 40px var(--accent); animation: none; }
+  @keyframes breathe { 50% { transform: scale(.92); opacity: .7; } }
+  button { font: inherit; font-size: 20px; padding: 14px 24px; border-radius: 14px; border: 0;
+           background: var(--accent); color: #000; margin: 4px; }
+  button.alt { background: var(--wait); }
+  button.stop { background: var(--hot); color: #fff; }
+  #status { color: var(--muted); margin-top: 8px; font-size: 20px; }
+  #err { color: var(--hot); margin-top: 8px; white-space: pre-wrap; text-align: left; font-size: 14px; }
+  #log { text-align: left; margin-top: 16px; }
+  #log p { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 8px 12px; margin: 6px 0; }
+  details { color: var(--muted); font-size: 13px; text-align: left; margin-top: 16px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>🎙️ Pixel Voice</h1>
+  <p>Turn on the wake word, then say <b>«Привет, Пиксель»</b>.
+     Say <b>«Пока, Пиксель»</b> to end the conversation, or just stop talking for a while.</p>
+  <div id="orb"></div>
+  <button id="wake" class="alt">👂 Wake word: off</button>
+  <button id="go">Talk now</button>
+  <button id="stop" class="stop" hidden>Stop</button>
+  <div id="status">Idle</div>
+  <div id="err"></div>
+  <div id="log"></div>
+  <details><summary>Event types seen (for debugging)</summary><div id="types"></div></details>
+</main>
+<audio id="speaker" autoplay></audio>
+<script>
+const $ = id => document.getElementById(id);
+const WAKE = /пиксел|pixel/i;                                       // "Привет, Пиксель", "Hey Pixel", …
+// Tolerates "Пик сель": transcription can split the word, even across two lines.
+const BYE = /(пока|стоп|спасибо)[,.!\s]*пик\s*сел|(bye|stop)[,.!\s]*pix\s*el/i;
+// Hang up after this much silence (no speech, no tool work) to stop paying for an idle line.
+// Brainstorms have pauses, so the default is generous; override with voice.html?idle=600.
+const IDLE_SECONDS = Number(new URLSearchParams(location.search).get("idle")) || 180;
+
+let pc = null, mic = null, meterTimer = null, idleTimer = null, busy = false;
+let channel = null;          // data channel the session's events arrive on; replies go back on it
+const pendingCalls = {};     // delegation_id -> function calls the backend is waiting on
+let wakeOn = false, recog = null;
+const buffers = {};          // partial transcript text per speaker
+const typesSeen = new Set();
+
+// ---------- sounds ----------
+let audioCtx = null;
+function tones(freqs, len = 0.12, type = "sine") {
+  audioCtx ??= new AudioContext();
+  let t = audioCtx.currentTime;
+  for (const f of freqs) {
+    const o = audioCtx.createOscillator(), g = audioCtx.createGain();
+    o.type = type;
+    o.frequency.value = f;
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(0.35, t + 0.02);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + len);
+    o.connect(g).connect(audioCtx.destination);
+    o.start(t);
+    o.stop(t + len + 0.02);
+    t += len * 0.9;
+  }
+}
+const chime = {
+  wake:  () => tones([523, 659, 784]),             // rising: "I heard you, starting"
+  ready: () => tones([1047], 0.25),                // ding: "connected, talk now"
+  bye:   () => tones([784, 659, 523]),             // falling: "going to sleep"
+  error: () => tones([196, 185], 0.3, "square"),   // low buzz: "something broke"
+};
+
+// ---------- status / transcript ----------
+function status(s) {
+  $("status").textContent = s;
+  report({ status: s });
+}
+function report(body) {
+  fetch("/api/voice", { method: "POST", headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify(body) }).catch(() => {});
+}
+function addLine(who, text) {
+  text = text.trim();
+  if (!text) return;
+  const p = document.createElement("p");
+  p.textContent = `${who} ${text}`;
+  $("log").prepend(p);
+  report({ line: `${who} ${text}` });
+}
+
+function armIdle() {
+  clearTimeout(idleTimer);
+  idleTimer = setTimeout(() => stop(`💤 Went to sleep after ${Math.round(IDLE_SECONDS / 60)} min of silence`),
+                         IDLE_SECONDS * 1000);
+}
+
+// Transcripts stream as session.input_transcript.delta (user) and
+// session.output_transcript.delta (assistant) with no "turn finished" event, so a
+// line is flushed when the other side starts talking or after a short silence.
+const flushTimers = {};
+let lastUser = { text: "", at: 0 };
+function flush(who) {
+  clearTimeout(flushTimers[who]);
+  if (buffers[who]) addLine(who, buffers[who]);
+  if (who === "👤" && buffers[who]) {
+    // Check this line together with the previous one: «Пока, Пик» + «сель» must still end the call.
+    const now = Date.now(), line = buffers[who];
+    const prev = now - lastUser.at < 6000 ? lastUser.text : "";
+    if ([line, prev + line, prev + " " + line].some(t => BYE.test(t))) setTimeout(() => stop("👋 Bye"), 1200);
+    lastUser = { text: line.trim(), at: now };
+  }
+  buffers[who] = "";
+}
+function onTranscript(who, text) {
+  armIdle();
+  const other = who === "👤" ? "🤖" : "👤";
+  if (buffers[other]) flush(other);
+  buffers[who] = (buffers[who] || "") + text;
+  clearTimeout(flushTimers[who]);
+  flushTimers[who] = setTimeout(() => flush(who), 1500);
+}
+
+function onEvent(raw) {
+  let ev;
+  try { ev = JSON.parse(raw); } catch { return; }
+  const type = String(ev.type || "unknown");
+  const inner = type === "response.event" ? `response.event/${ev.event?.type}` : type;
+  if (!typesSeen.has(inner)) {
+    typesSeen.add(inner);
+    $("types").textContent = [...typesSeen].join("\n");
+  }
+  logEvent(inner, raw);
+  if (type === "response.event") return onBackendEvent(ev);
+  // In case function calls arrive unwrapped.
+  if (type.startsWith("response.function_call") || ev.item?.type === "function_call") return onBackendEvent(ev);
+  if (type === "session.started") {
+    chime.ready();
+    armIdle();
+    status("Listening. Go ahead and talk");
+  } else if (type === "session.delegation.created") {
+    status("🔎 Looking it up…");
+    watchBackend();
+  } else if (type === "error" || type.endsWith(".error") || ev.error) {
+    const msg = JSON.stringify(ev.error || ev, null, 2);
+    $("err").textContent = msg;
+    addLine("⚠️", msg.slice(0, 300));
+  }
+  if (typeof ev.delta === "string") {
+    if (type === "session.input_transcript.delta") onTranscript("👤", ev.delta);
+    else if (type === "session.output_transcript.delta") onTranscript("🤖", ev.delta);
+  }
+}
+
+// ---------- backend function calls ----------
+// With Responses delegation, backend events arrive wrapped in response.event. When the backend
+// calls one of our functions, we run it on the phone's server (which holds the keys), send each
+// result back as a function_call_output item, then ask the backend to continue.
+function send(obj) {
+  if (channel?.readyState === "open") channel.send(JSON.stringify(obj));
+}
+
+// Every event goes to server.log (deltas only once per type, they're noisy), so a stalled
+// tool call can be debugged from the Mac without the phone's screen.
+const loggedDeltas = new Set();
+function logEvent(type, raw) {
+  if (type.endsWith(".delta")) {
+    if (loggedDeltas.has(type)) return;
+    loggedDeltas.add(type);
+  }
+  report({ event: raw.length > 1500 ? raw.slice(0, 1500) + "…" : raw });
+}
+
+// If a delegation goes quiet, say so on screen and in the log instead of hanging silently.
+let backendTimer = null;
+function watchBackend() {
+  clearTimeout(backendTimer);
+  backendTimer = setTimeout(() => {
+    const waiting = Object.values(pendingCalls).flat().map(c => c.name);
+    addLine("⚠️", waiting.length ? `backend still waiting after 30 s; unsent tool calls: ${waiting.join(", ")}`
+                                  : "backend silent for 30 s (no tool call or answer arrived)");
+  }, 30000);
+}
+
+// The exact event shapes for function calls aren't pinned down, so collect them from every
+// place they can appear: a finished output item, finished arguments, or the completed
+// response's output list. Each call_id runs once.
+const doneCalls = new Set();
+const callNames = {};        // item id -> function name, from response.output_item.added
+function collectCall(did, item) {
+  if (!item || !item.call_id || doneCalls.has(item.call_id)) return;
+  const list = (pendingCalls[did] ??= []);
+  const known = list.find(c => c.call_id === item.call_id);
+  if (known) Object.assign(known, Object.fromEntries(Object.entries(item).filter(([, v]) => v)));
+  else list.push({ ...item });
+}
+
+let flushCallsTimer = null;
+async function onBackendEvent(env) {
+  const e = env.event || env;
+  const did = env.delegation_id || e.delegation_id || "none";
+  armIdle();  // backend work counts as activity
+  watchBackend();
+  const t = String(e.type || "");
+  if (t === "response.output_item.added" && e.item?.type === "function_call") {
+    callNames[e.item.id] = e.item.name;
+    collectCall(did, e.item);
+  } else if (t === "response.output_item.done" && e.item?.type === "function_call") {
+    collectCall(did, e.item);
+  } else if (t === "response.function_call_arguments.done") {
+    collectCall(did, { call_id: e.call_id, name: e.name || callNames[e.item_id], arguments: e.arguments });
+  } else if (["response.completed", "response.done", "response.incomplete"].includes(t)) {
+    for (const item of e.response?.output || []) if (item.type === "function_call") collectCall(did, item);
+    return runPendingCalls(did);
+  } else if (t === "error" || t === "response.failed") {
+    addLine("⚠️", `backend: ${JSON.stringify(e.error || e.response?.error || e).slice(0, 300)}`);
+    return;
+  }
+  // Fallback if no completion event ever arrives for a response that asked for a tool.
+  if (pendingCalls[did]?.length) {
+    clearTimeout(flushCallsTimer);
+    flushCallsTimer = setTimeout(() => runPendingCalls(did), 4000);
+  }
+}
+
+async function runPendingCalls(did) {
+  clearTimeout(flushCallsTimer);
+  const calls = (pendingCalls[did] || []).filter(c => c.name && !doneCalls.has(c.call_id));
+  delete pendingCalls[did];
+  if (!calls.length) return clearTimeout(backendTimer);  // response finished without a tool call
+  calls.forEach(c => doneCalls.add(c.call_id));
+  status(`🔧 ${calls.map(c => c.name).join(", ")}…`);
+  const outputs = await Promise.all(calls.map(runTool));
+  calls.forEach((c, i) => send({
+    type: "response.item.create",
+    event_id: `tool_${c.call_id}`,
+    item: { type: "function_call_output", call_id: c.call_id, output: outputs[i] },
+  }));
+  send({ type: "response.create", event_id: `continue_${Date.now()}` });
+  report({ line: `🔧 sent ${calls.length} tool result(s) back, asked the backend to continue` });
+  status("🔎 Working on it…");
+}
+
+async function runTool(call) {
+  try {
+    const res = await fetch("/api/tool", { method: "POST", headers: { "Content-Type": "application/json" },
+                                           body: JSON.stringify({ name: call.name, arguments: call.arguments }) });
+    const data = await res.json();
+    return data.output ?? JSON.stringify({ error: data.error || `HTTP ${res.status}` });
+  } catch (err) {
+    return JSON.stringify({ error: `tool call failed: ${err.message || err}` });
+  }
+}
+
+// Make the orb pulse with the assistant's voice.
+function meter(stream) {
+  audioCtx ??= new AudioContext();
+  const an = audioCtx.createAnalyser();
+  audioCtx.createMediaStreamSource(stream).connect(an);
+  const buf = new Uint8Array(an.fftSize);
+  meterTimer = setInterval(() => {
+    an.getByteTimeDomainData(buf);
+    let peak = 0;
+    for (const v of buf) peak = Math.max(peak, Math.abs(v - 128));
+    $("orb").style.transform = `scale(${1 + peak / 160})`;
+  }, 60);
+}
+
+// ---------- GPT-Live session ----------
+async function start() {
+  if (busy) return;
+  busy = true;
+  stopWakeListener();  // free the microphone for the call
+  $("err").textContent = "";
+  $("go").hidden = true;
+  $("stop").hidden = false;
+  chime.wake();
+  status("🚀 Starting…");
+  try {
+    mic = await navigator.mediaDevices.getUserMedia({ audio: true });
+    pc = new RTCPeerConnection();
+    pc.addTrack(mic.getTracks()[0], mic);
+    pc.ontrack = e => { $("speaker").srcObject = e.streams[0]; meter(e.streams[0]); };
+    const listen = ch => { ch.onmessage = m => { channel = ch; onEvent(m.data); }; };
+    channel = pc.createDataChannel("oai-events");
+    listen(channel);
+    pc.ondatachannel = e => listen(e.channel);
+    pc.onconnectionstatechange = () => {
+      if (["failed", "disconnected"].includes(pc?.connectionState)) {
+        stop(`Connection to OpenAI ${pc.connectionState} (network drop or session ended by OpenAI)`, true);
+      }
+    };
+
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    status("🚀 Connecting to GPT-Live…");
+    const res = await fetch("/api/live", { method: "POST", headers: { "Content-Type": "application/json" },
+                                           body: JSON.stringify({ sdp: offer.sdp }) });
+    const data = await res.json().catch(() => ({}));
+    if (res.status === 404) {
+      throw new Error("The dashboard server running on the phone is an old version without the voice API. " +
+                      "Restart it: bash ~/pixel_to_Pi/scripts/restart-dashboard.sh");
+    }
+    if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+    await pc.setRemoteDescription({ type: "answer", sdp: data.sdp });
+    if (!String(data.mode || "").startsWith("responses")) {
+      addLine("⚠️", `No search or tools this session (OpenAI accepted only the "${data.mode}" setup). ` +
+                    "See server.log for why delegation was refused.");
+    }
+    try { await navigator.wakeLock?.request("screen"); } catch {}
+    $("orb").className = "on";
+    status("Starting session…");  // becomes "Listening" on session.started
+  } catch (e) {
+    $("err").textContent = String(e.message || e);
+    stop("Error", true);
+  }
+}
+
+function stop(why = "Stopped", failed = false) {
+  if (!busy) return;
+  busy = false;
+  clearTimeout(idleTimer);
+  clearTimeout(backendTimer);
+  clearTimeout(flushCallsTimer);
+  clearInterval(meterTimer);
+  flush("👤");
+  flush("🤖");
+  addLine("⏹", why);  // shows on the dashboard too, so "it stopped" comes with a reason
+  (failed ? chime.error : chime.bye)();
+  $("orb").style.transform = "";
+  mic?.getTracks().forEach(t => t.stop());
+  mic = null;
+  if (pc) {
+    pc.close();
+    pc = null;
+    fetch("/api/live/hangup", { method: "POST", body: "{}" }).catch(() => {});
+  }
+  $("stop").hidden = true;
+  $("go").hidden = false;
+  status(why);
+  if (wakeOn) setTimeout(startWakeListener, 1500);
+  else $("orb").className = "";
+}
+
+// ---------- wake word ----------
+// Chrome's speech recognition listens for the phrase. On Android it stops every
+// few seconds, so it's restarted in a loop. It can't share the mic with the
+// call, so it pauses while a session runs.
+const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+
+function startWakeListener() {
+  if (!wakeOn || busy || recog) return;
+  recog = new Recognition();
+  recog.lang = "ru-RU";
+  recog.continuous = true;
+  recog.interimResults = true;
+  recog.onresult = e => {
+    for (let i = e.resultIndex; i < e.results.length; i++) {
+      if (WAKE.test(e.results[i][0].transcript)) {
+        addLine("👂", e.results[i][0].transcript);
+        start();
+        return;
+      }
+    }
+  };
+  recog.onerror = e => {
+    if (e.error === "not-allowed") {
+      $("err").textContent = "Microphone permission denied for speech recognition.";
+      setWake(false);
+    }
+  };
+  recog.onend = () => {
+    recog = null;
+    if (wakeOn && !busy) setTimeout(startWakeListener, 250);
+  };
+  try { recog.start(); } catch { recog = null; }
+  $("orb").className = "waiting";
+  status("👂 Waiting for «Привет, Пиксель»");
+}
+
+function stopWakeListener() {
+  if (recog) {
+    recog.onend = null;
+    recog.abort();
+    recog = null;
+  }
+}
+
+function setWake(on) {
+  wakeOn = on;
+  try { localStorage.setItem("wakeOn", on ? "1" : "0"); } catch {}
+  $("wake").textContent = on ? "👂 Wake word: on" : "👂 Wake word: off";
+  if (on) {
+    tones([659], 0.1);  // also unlocks audio playback for later chimes
+    startWakeListener();
+  } else {
+    stopWakeListener();
+    if (!busy) { $("orb").className = ""; status("Idle"); }
+  }
+}
+
+if (!Recognition) {
+  $("wake").disabled = true;
+  $("wake").textContent = "👂 Wake word not supported in this browser";
+}
+$("wake").onclick = e => { e.stopPropagation(); setWake(!wakeOn); };
+
+// After a reload the wake word was silently off. Remember it; Chrome still needs one tap
+// before the page may use the mic and play sounds, so ask for it clearly.
+let savedWake = false;
+try { savedWake = localStorage.getItem("wakeOn") === "1"; } catch {}
+if (savedWake && Recognition) {
+  status("👆 Tap anywhere to resume listening for «Привет, Пиксель»");
+  $("status").style.cssText = "color: var(--wait); font-size: 26px; font-weight: 700";
+  document.addEventListener("click", function resume() {
+    document.removeEventListener("click", resume);
+    $("status").style.cssText = "";
+    if (!wakeOn) setWake(true);
+  });
+}
+$("go").onclick = start;
+$("stop").onclick = () => stop();
+window.addEventListener("pagehide", () => stop("Page closed"));
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden && busy) addLine("⚠️", "Voice page left the screen; Android may cut the mic. Keep it in front.");
+});
+</script>
+</body>
+</html>
